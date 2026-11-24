@@ -1,0 +1,14 @@
+.build/
+dist/
+.DS_Store
+.swiftpm/
+
+.speaker-venv/
+.worker-build/
+.worker-tmp/
+Models/
+__pycache__/
+
+.worker-test/
+.runtime-src/
+.runtime-build/

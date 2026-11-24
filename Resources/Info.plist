@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.spikdoum.app</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>CFBundleName</key><string>SpikDoum</string>
+<key>CFBundleDisplayName</key><string>SpikDoum</string>
+<key>CFBundleExecutable</key><string>SpikDoum</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.5.0</string>
+<key>CFBundleVersion</key><string>25</string>
+<key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>NSMicrophoneUsageDescription</key><string>대화를 듣고 실시간 조언을 제공하기 위해 마이크를 사용합니다.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>대화 내용을 텍스트로 바꾸어 대화 조언을 제공합니다.</string>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+<key>NSLocalNetworkUsageDescription</key><string>사용자가 지정한 내부망 LLM 서버에 연결해 번역·답변·요약을 생성합니다.</string>
+<key>NSAudioCaptureUsageDescription</key><string>이어폰으로 듣는 상대방의 대화를 인식하고 번역하기 위해 Mac 재생음을 수집합니다.</string>
+<key>NSScreenCaptureUsageDescription</key><string>통화 중 상대방의 시스템 오디오를 수집하기 위해 화면 및 시스템 오디오 기록 권한이 필요합니다. 화면 영상은 저장하지 않습니다.</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
