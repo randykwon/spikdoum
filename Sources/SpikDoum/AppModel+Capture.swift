@@ -251,6 +251,10 @@ extension AppModel {
         }
     }
     func stop() {
+        if !restartingForSettingsChange {
+            liveCaptureRestartTask?.cancel()
+            liveCaptureRestartTask = nil
+        }
         finishingCapture = false
         managedMic.stop(); managedSystem.stop()
         keywordToken = UUID()

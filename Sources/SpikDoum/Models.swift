@@ -4,6 +4,10 @@ struct Advice: Codable, Identifiable {
     var id = UUID()
     var date = Date()
     var text: String
+    var sourceLanguageText: String? = nil
+    var targetLanguageText: String? = nil
+    var sourceLanguageName: String? = nil
+    var targetLanguageName: String? = nil
     var sourceSnapshot: String? = nil
     var sourceStart: Int? = nil
     var sourceEnd: Int? = nil
@@ -95,5 +99,99 @@ enum AdvicePolicy {
             return overlap >= 0.80 && min(old.count, candidate.count) >= 15
         }
     }
+    static func parseBilingual(_ raw: String) -> (sourceText: String, targetText: String)? {
+        let pattern = #"(?is)(?:^|\n)\s*(?:#+\s*)?\[STT_LANG\]:?\s*(.*?)\s*(?:^|\n)\s*(?:#+\s*)?\[TARGET_LANG\]:?\s*(.*)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+              let r1 = Range(match.range(at: 1), in: raw),
+              let r2 = Range(match.range(at: 2), in: raw) else { return nil }
+        let sourceText = raw[r1].trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetText = raw[r2].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sourceText.isEmpty, !targetText.isEmpty else { return nil }
+        return (sourceText, targetText)
+    }
+
+    static func makeAdvice(
+        raw: String,
+        sourceLanguageName: String?,
+        targetLanguageName: String?,
+        sourceSnapshot: String?,
+        sourceStart: Int?,
+        sourceEnd: Int?,
+        sourceExcerpt: String?
+    ) -> Advice {
+        if let pair = parseBilingual(raw) {
+            let srcLabel = sourceLanguageName ?? "STT"
+            let dstLabel = targetLanguageName ?? "번역"
+            let combined = "[\(srcLabel)]\n\(pair.sourceText)\n\n[\(dstLabel)]\n\(pair.targetText)"
+            return Advice(
+                text: combined,
+                sourceLanguageText: pair.sourceText,
+                targetLanguageText: pair.targetText,
+                sourceLanguageName: srcLabel,
+                targetLanguageName: dstLabel,
+                sourceSnapshot: sourceSnapshot,
+                sourceStart: sourceStart,
+                sourceEnd: sourceEnd,
+                sourceExcerpt: sourceExcerpt
+            )
+        }
+        return Advice(
+            text: raw,
+            sourceSnapshot: sourceSnapshot,
+            sourceStart: sourceStart,
+            sourceEnd: sourceEnd,
+            sourceExcerpt: sourceExcerpt
+        )
+    }
     static func context(_ text: String) -> String { String(text.suffix(3000)) }
+
+    /// Conservative token estimate tailored for Apple FoundationModels (4,096-token window):
+    /// CJK / non-ASCII characters frequently tokenize to ~1.5–2.2 tokens each, whereas ASCII averages ~0.35 tokens.
+    static func estimatedTokens(_ text: String) -> Int {
+        var units = 0 // 1 token == 10 units
+        for scalar in text.unicodeScalars {
+            if scalar.isASCII {
+                units += 4
+            } else {
+                units += 22
+            }
+        }
+        return (units + 9) / 10
+    }
+
+    static func boundedTail(_ text: String, maxTokens: Int) -> String {
+        guard maxTokens > 0, !text.isEmpty else { return "" }
+        let maxUnits = maxTokens * 10
+        var units = 0
+        var start = text.endIndex
+        while start > text.startIndex {
+            let prev = text.index(before: start)
+            var charUnits = 0
+            for scalar in text[prev].unicodeScalars {
+                charUnits += scalar.isASCII ? 4 : 22
+            }
+            if units + charUnits > maxUnits { break }
+            units += charUnits
+            start = prev
+        }
+        return String(text[start...])
+    }
+
+    static func boundedHead(_ text: String, maxTokens: Int) -> String {
+        guard maxTokens > 0, !text.isEmpty else { return "" }
+        let maxUnits = maxTokens * 10
+        var units = 0
+        var end = text.startIndex
+        while end < text.endIndex {
+            var charUnits = 0
+            for scalar in text[end].unicodeScalars {
+                charUnits += scalar.isASCII ? 4 : 22
+            }
+            if units + charUnits > maxUnits { break }
+            units += charUnits
+            end = text.index(after: end)
+        }
+        return String(text[..<end])
+    }
 }

@@ -20,7 +20,20 @@ final class AppModel: ObservableObject {
     @Published var panelTypography = PanelTypography.load() { didSet { panelTypography.save() } }
     @Published var panelLayout = PanelLayout.load() { didSet { panelLayout.save() } }
     @Published var sttAppearance = STTAppearance.load() { didSet { sttAppearance.save() } }
-    @Published var settings = EngineSettings.load() { didSet { settings.save() } }
+    @Published var settings = EngineSettings.load() {
+        didSet {
+            settings.save()
+            guard oldValue != settings else { return }
+            if oldValue.stt != settings.stt {
+                scheduleLiveCaptureRestart(notice: "STT 엔진이 변경되어 듣기를 자동 재연결합니다.")
+            }
+            if oldValue.translation != settings.translation
+                || oldValue.azureRegion != settings.azureRegion
+                || oldValue.localTranslation != settings.localTranslation {
+                reloadTranslationEngineAfterSettingsChange()
+            }
+        }
+    }
     @Published var systemAudioPermissionGranted = CGPreflightScreenCaptureAccess()
     @Published var permissionStatus = AudioPermissions.status
     @Published var changingOutputDevice = false
@@ -38,24 +51,32 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(meetingTarget.rawValue, forKey: "meetingAudioTarget")
             if meetingTarget != .all { includeSystemAudio = true; systemAudioOnly = false }
+            if oldValue != meetingTarget && listening { scheduleLiveCaptureRestart() }
         }
     }
     @Published var systemAudioOnly = UserDefaults.standard.bool(forKey: "systemAudioOnly") {
         didSet {
             UserDefaults.standard.set(systemAudioOnly, forKey: "systemAudioOnly")
             if systemAudioOnly { deviceError = nil }
+            if oldValue != systemAudioOnly && listening { scheduleLiveCaptureRestart() }
         }
     }
     let audioLevelMonitor = AudioLevelMonitor()
     @Published var includeSystemAudio = UserDefaults.standard.bool(forKey: "includeSystemAudio") {
-        didSet { UserDefaults.standard.set(includeSystemAudio, forKey: "includeSystemAudio") }
+        didSet {
+            UserDefaults.standard.set(includeSystemAudio, forKey: "includeSystemAudio")
+            if oldValue != includeSystemAudio && listening { scheduleLiveCaptureRestart() }
+        }
     }
     let systemAudio = SystemAudioCapture()
     let systemSpeech = SpeechCapture()
     let audioRecorder = ConversationAudioRecorder()
     var recordingConversationID: UUID?
     @Published var recordAudioForReplay = (UserDefaults.standard.object(forKey: "recordAudioForReplay") as? Bool) ?? true {
-        didSet { UserDefaults.standard.set(recordAudioForReplay, forKey: "recordAudioForReplay") }
+        didSet {
+            UserDefaults.standard.set(recordAudioForReplay, forKey: "recordAudioForReplay")
+            if oldValue != recordAudioForReplay && listening { scheduleLiveCaptureRestart() }
+        }
     }
     @Published var autoStartListeningOnNewConversation = UserDefaults.standard.bool(forKey: "autoStartListeningOnNewConversation") {
         didSet { UserDefaults.standard.set(autoStartListeningOnNewConversation, forKey: "autoStartListeningOnNewConversation") }
@@ -102,9 +123,50 @@ final class AppModel: ObservableObject {
     @Published var autoAdvice = (UserDefaults.standard.object(forKey: "automaticAdvice") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(autoAdvice, forKey: "automaticAdvice") }
     }
+    @Published var bilingualCoach = (UserDefaults.standard.object(forKey: "bilingualCoach") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(bilingualCoach, forKey: "bilingualCoach") }
+    }
     @Published var inputDevices: [AudioInputDevice] = []
     @Published var selectedInputUID = UserDefaults.standard.string(forKey: "inputDeviceUID") ?? "" {
-        didSet { UserDefaults.standard.set(selectedInputUID, forKey: "inputDeviceUID") }
+        didSet {
+            UserDefaults.standard.set(selectedInputUID, forKey: "inputDeviceUID")
+            if oldValue != selectedInputUID && listening && !systemAudioOnly {
+                scheduleLiveCaptureRestart(notice: "입력 마이크가 변경되어 듣기를 자동 재연결합니다.")
+            }
+        }
+    }
+    var liveCaptureRestartTask: Task<Void, Never>?
+    var restartingForSettingsChange = false
+
+    func scheduleLiveCaptureRestart(notice: String? = nil) {
+        guard listening, !starting, !restartingForSettingsChange else { return }
+        if let notice { presetNotice = notice }
+        liveCaptureRestartTask?.cancel()
+        liveCaptureRestartTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, let self, self.listening, !self.starting else { return }
+            self.restartingForSettingsChange = true
+            defer { self.restartingForSettingsChange = false }
+            self.stop()
+            await self.start()
+        }
+    }
+
+    func reloadTranslationEngineAfterSettingsChange() {
+        translationDebounce?.cancel(); translationDebounce = nil
+        translationWatchdog?.cancel()
+        translationTask?.cancel()
+        translationToken = UUID()
+        translating = false
+        liveTranslation = ""
+        translationSource = ""
+        translationRetryCount = 0
+        translationRetryAfter = .distantPast
+        translationError = nil
+        nativeTranslationSessions.removeAll()
+        if !(current?.transcript.isEmpty ?? true) {
+            translateLatest(automatic: true)
+        }
     }
     @Published var summarizing = false
     @Published var summaryError: String?
@@ -225,6 +287,19 @@ final class AppModel: ObservableObject {
     }
     var sourceLanguageSpec: SupportedLanguage? {
         language == LanguageCatalog.autoCode ? nil : LanguageCatalog.language(for: language)
+    }
+    func effectiveCoachSourceLanguage(for context: String) -> SupportedLanguage? {
+        if let fixed = sourceLanguageSpec { return fixed }
+        let cleaned = TranslationPolicy.preparedForTranslation(context)
+        return LanguageCatalog.detectLanguage(for: cleaned.isEmpty ? context : cleaned) ?? detectedSTTLanguage
+    }
+    var coachLanguageSummary: String {
+        guard bilingualCoach else { return targetLanguageName }
+        let sttSpec = sourceLanguageSpec ?? detectedSTTLanguage
+        if let sttSpec, sttSpec.code == targetLanguageSpec.code {
+            return targetLanguageName
+        }
+        return "\(sttLanguageBadge) + \(targetLanguageName)"
     }
     @Published var liveResponse = ""
     @Published var translationConfiguration: TranslationSession.Configuration?
@@ -371,13 +446,19 @@ final class AppModel: ObservableObject {
     }
 
     func applyPreset(_ preset: CapturePreset, browser: MeetingAudioTarget = .chrome) {
-        guard !listening, !starting else { return }
+        guard !starting else { return }
         let plan = preset.plan(browser: browser)
+        let wasListening = listening
         meetingTarget = plan.target
         includeSystemAudio = plan.systemAudio
         systemAudioOnly = plan.systemOnly
         autoAdvice = plan.automaticAdvice
-        presetNotice = "\(preset.title) 추천 설정 적용됨 · 인식 언어를 확인하고 듣기 시작을 누르세요."
+        if wasListening {
+            presetNotice = "\(preset.title) 추천 설정 적용됨 · 듣기를 자동으로 재연결합니다."
+            scheduleLiveCaptureRestart()
+        } else {
+            presetNotice = "\(preset.title) 추천 설정 적용됨 · 인식 언어를 확인하고 듣기 시작을 누르세요."
+        }
     }
 
     func newConversation(autoStart: Bool = false) {

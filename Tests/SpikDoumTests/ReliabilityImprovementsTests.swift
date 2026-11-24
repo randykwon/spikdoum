@@ -561,3 +561,60 @@ import Testing
     #expect(TranslationPolicy.preparedForTranslation(noisy) == "おはようございます。 今日はいい天気ですね。")
     #expect(TranslationPolicy.preparedForTranslation("[BLANK_AUDIO]\n(音楽)\n(拍手)").isEmpty)
 }
+
+@Test func bilingualCoachParsesBothLanguagesAndPreservesCombinedFallback() {
+    let raw = """
+    [STT_LANG]
+    Reply: Could we confirm the launch date by Friday?
+    Advice: Ask for the exact owner of the QA checklist.
+    [TARGET_LANG]
+    Reply: 금요일까지 출시 일정을 확정할 수 있을까요?
+    Advice: QA 체크리스트 담당자를 정확히 확인해 보세요.
+    """
+    let advice = AdvicePolicy.makeAdvice(
+        raw: raw,
+        sourceLanguageName: "영어",
+        targetLanguageName: "한국어",
+        sourceSnapshot: nil,
+        sourceStart: 0,
+        sourceEnd: 20,
+        sourceExcerpt: "Let's finalize launch."
+    )
+    #expect(advice.sourceLanguageName == "영어")
+    #expect(advice.targetLanguageName == "한국어")
+    #expect(advice.sourceLanguageText?.contains("launch date by Friday") == true)
+    #expect(advice.targetLanguageText?.contains("금요일까지 출시 일정") == true)
+    #expect(advice.text.contains("[영어]") && advice.text.contains("[한국어]"))
+
+    // Non-bilingual plain output gracefully falls back to single text.
+    let plain = AdvicePolicy.makeAdvice(
+        raw: "Reply: 네, 확인하겠습니다.",
+        sourceLanguageName: "한국어",
+        targetLanguageName: "한국어",
+        sourceSnapshot: nil,
+        sourceStart: nil,
+        sourceEnd: nil,
+        sourceExcerpt: nil
+    )
+    #expect(plain.sourceLanguageText == nil)
+    #expect(plain.targetLanguageText == nil)
+    #expect(plain.text == "Reply: 네, 확인하겠습니다.")
+}
+
+@Test func appleContextTokenBudgetTightlyBoundsCJKAndPreservesNewestSpeech() {
+    let longJapanese = String(repeating: "明日の会議のスケジュールを確認しましょう。", count: 200) // ~4,000 CJK chars
+    let bounded = AdvicePolicy.boundedTail(longJapanese, maxTokens: 1100)
+    #expect(bounded.count < 600)
+    #expect(AdvicePolicy.estimatedTokens(bounded) <= 1100)
+    #expect(longJapanese.hasSuffix(bounded))
+
+    let longEnglish = String(repeating: "Let us review the project schedule tomorrow. ", count: 120) // ~5,400 ASCII chars
+    let boundedEn = AdvicePolicy.boundedTail(longEnglish, maxTokens: 1100)
+    #expect(boundedEn.count > 2000)
+    #expect(AdvicePolicy.estimatedTokens(boundedEn) <= 1100)
+    #expect(longEnglish.hasSuffix(boundedEn))
+
+    let head = AdvicePolicy.boundedHead(longJapanese, maxTokens: 200)
+    #expect(AdvicePolicy.estimatedTokens(head) <= 200)
+    #expect(longJapanese.hasPrefix(head))
+}

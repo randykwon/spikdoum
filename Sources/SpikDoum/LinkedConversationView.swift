@@ -84,6 +84,7 @@ struct LinkedConversationView: View {
                         if model.generating { ProgressView().controlSize(.mini) }
                         Menu {
                             Toggle("자동 조언", isOn: $model.autoAdvice)
+                            Toggle("STT + 번역 언어 동시 코칭", isOn: $model.bilingualCoach)
                             Button("지금 조언 받기") { Task { await model.advise() } }
                                 .disabled(model.generating || model.current?.archivedAt != nil || (model.current?.transcript.isEmpty ?? true))
                         } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("대화 코치 설정")
@@ -120,7 +121,7 @@ struct LinkedConversationView: View {
                                     ForEach(unlinkedAdvice) { item in
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(item.date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
-                                            Text(item.text).font(.system(size: model.panelTypography.advice)).lineSpacing(5).textSelection(.enabled)
+                                            AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
                                         }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
                                             .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
                                     }
@@ -180,7 +181,7 @@ struct LinkedConversationView: View {
                 ForEach(block.advice) { item in
                     VStack(alignment: .leading, spacing: 6) {
                         LinkBadge(model: model, spans: ConversationLinks.spans(for: item, in: conversation), context: true)
-                        Text(item.text).font(.system(size: model.panelTypography.advice)).lineSpacing(5).textSelection(.enabled)
+                        AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
                     }
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(12).background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))

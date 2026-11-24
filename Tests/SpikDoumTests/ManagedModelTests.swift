@@ -38,6 +38,9 @@ private func fixtureModel(data: Data, hash: String? = nil) -> ManagedModel {
 }
 @Test func managedCatalogUsesPinnedVerifiedModelsAndLoopbackArguments() {
     #expect(Set(ManagedModelCatalog.all.map(\.id)).count == ManagedModelCatalog.all.count)
+    #expect(Set(ManagedModelCatalog.all.map(\.filename)).count == ManagedModelCatalog.all.count)
+    #expect(ManagedModelCatalog.all.filter { $0.role == .stt }.count >= 9)
+    #expect(ManagedModelCatalog.all.filter { $0.role == .translation }.count >= 10)
     for model in ManagedModelCatalog.all {
         #expect(model.url.scheme == "https")
         #expect(model.revision.count == 40)
@@ -50,7 +53,41 @@ private func fixtureModel(data: Data, hash: String? = nil) -> ManagedModel {
         #expect(args.contains(path.path))
         #expect(args.contains("127.0.0.1"))
         #expect(!args.contains("0.0.0.0"))
+        if role == .translation {
+            #expect(args.contains("--reasoning"))
+            #expect(args.contains("off"))
+        }
     }
+    #expect(ManagedModelManager.stripThinkingTags("<think>internal reasoning</think>\n안녕하세요.") == "안녕하세요.")
+}
+
+@MainActor @Test func customLocalModelImportSelectAndRemoveWorkCleanly() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let suite = "SpikDoum.CustomModelTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    let sourceGGUF = root.appendingPathComponent("MyCustomTranslator.gguf")
+    try Data("gguf-bytes".utf8).write(to: sourceGGUF)
+
+    let manager = ManagedModelManager(root: root.appendingPathComponent("models"), defaults: defaults)
+    defer { manager.shutdown() }
+
+    // Reject wrong extension for STT.
+    #expect(throws: (any Error).self) { try manager.importCustomModel(from: sourceGGUF, role: .stt) }
+
+    let imported = try manager.importCustomModel(from: sourceGGUF, role: .translation)
+    #expect(imported.isCustom)
+    #expect(manager.installed.contains(imported.id))
+    await manager.select(imported)
+    #expect(manager.selected(.translation)?.id == imported.id)
+
+    await manager.remove(imported)
+    #expect(!manager.installed.contains(imported.id))
+    #expect(manager.customModels.isEmpty)
 }
 @Test func managedSTTProducesValidPCMHeaderAndAuthenticatedMultipartUpload() throws {
     let pcm = Data([1, 0, 2, 0]), wave = ManagedSTTClient.wave(pcm: pcm)

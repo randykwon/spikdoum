@@ -7,6 +7,7 @@ struct ManagedModelStore: Sendable {
     func receipt(_ model: ManagedModel) -> URL { root.appendingPathComponent(model.id + ".verified") }
     func installed(_ model: ManagedModel) -> Bool {
         let size = (try? FileManager.default.attributesOfItem(atPath: file(model).path)[.size] as? NSNumber)?.int64Value
+        if model.isCustom { return (size ?? 0) > 0 }
         return size == model.bytes && (try? String(contentsOf: receipt(model), encoding: .utf8)) == model.sha256
     }
     func finalize(_ temporary: URL, model: ManagedModel, cancelled: () -> Bool = { false }) throws {

@@ -14,7 +14,7 @@ struct CaptureOptionsView: View {
                 }
                 Button("Zoom") { model.applyPreset(.zoom) }
                 Button(model.t("preset.inPerson")) { model.applyPreset(.inPerson) }
-            }.disabled(model.listening || model.starting)
+            }.disabled(model.starting)
             if let notice = model.presetNotice { Text(notice).font(.caption).foregroundStyle(.blue) }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 12) {
@@ -68,9 +68,9 @@ struct CaptureOptionsView: View {
                         if !model.selectedInputUID.isEmpty && !model.inputDevices.contains(where: { $0.uid == model.selectedInputUID }) {
                             Text("연결되지 않은 장치").tag(model.selectedInputUID)
                         }
-                    }.disabled(model.listening || model.starting)
+                    }.disabled(model.starting)
                     Button { model.refreshInputDevices() } label: { Image(systemName: "arrow.clockwise") }.help("입력 장치 새로고침")
-                    Text(model.listening ? "장치를 바꾸려면 듣기를 중지하세요." : "이 앱에서 사용할 마이크를 선택하세요.").font(.caption).foregroundStyle(.secondary)
+                    Text("이 앱에서 사용할 마이크를 선택하세요. 듣기 중 변경 시 자동 재연결됩니다.").font(.caption).foregroundStyle(.secondary)
                 }
                 HStack {
                     Picker("출력 디바이스", selection: Binding(get: { model.selectedOutputUID }, set: model.chooseOutputDevice)) {
@@ -84,23 +84,23 @@ struct CaptureOptionsView: View {
                 HStack {
                     Picker("통화 대상", selection: $model.meetingTarget) {
                         ForEach(MeetingAudioTarget.allCases, id: \.self) { target in Text(target.title).tag(target) }
-                    }.disabled(model.listening || model.starting)
+                    }.disabled(model.starting)
                     Text("회의 앱과 동일한 마이크·스피커를 선택하세요.").font(.caption).foregroundStyle(.secondary)
                 }
                 if model.meetingTarget != .all && model.meetingTarget != .zoom {
                     Text("선택한 브라우저의 다른 탭 소리도 포함될 수 있습니다.").font(.caption2).foregroundStyle(.secondary)
                 }
                 Toggle("통화 모드 · 마이크와 회의 상대방 소리 함께 듣기", isOn: $model.includeSystemAudio)
-                    .font(.caption).disabled(model.listening || model.starting)
+                    .font(.caption).disabled(model.starting)
                 HStack {
-                    Toggle("Mac 소리만 인식 · 마이크 사용 안 함", isOn: $model.systemAudioOnly).disabled(model.listening || model.starting)
+                    Toggle("Mac 소리만 인식 · 마이크 사용 안 함", isOn: $model.systemAudioOnly).disabled(model.starting)
                     if model.includeSystemAudio || model.systemAudioOnly {
                         SystemAudioLevelBar(monitor: model.audioLevelMonitor)
                         Text("Mac 소리 입력").font(.caption)
                     }
                 }.font(.caption)
                 Toggle(model.t("settings.recordAudio"), isOn: $model.recordAudioForReplay)
-                    .font(.caption).disabled(model.listening || model.starting)
+                    .font(.caption).disabled(model.starting)
                 Toggle(model.t("settings.autoStartNew"), isOn: $model.autoStartListeningOnNewConversation)
                     .font(.caption)
                 Text(model.systemAudioOnly ? "Mac 재생음 전용 · 선택한 마이크의 연결 상태와 무관하게 동작합니다." : "입력: \(model.activeInputName) · \(model.permissionStatus)").font(.caption2).foregroundStyle(.secondary)

@@ -282,7 +282,7 @@ struct ContentView: View {
                     Button { showingModels = true } label: { Label("모델 · 서버 관리", systemImage: "server.rack") }
                         .labelStyle(.iconOnly).help("자체 STT · 번역 모델 다운로드 및 서버 모니터")
                     Button { showingSettings = true } label: { Label(model.t("settings.title"), systemImage: "gearshape") }
-                        .labelStyle(.iconOnly).help(model.t("settings.title")).disabled(model.listening || model.starting)
+                        .labelStyle(.iconOnly).help(model.t("settings.title")).disabled(model.starting)
                     Button { showSummaryScriptPanel.toggle() } label: {
                         Label(model.t("panel.summaryScriptToggle"), systemImage: showSummaryScriptPanel ? "sidebar.right" : "sidebar.squares.right")
                     }.labelStyle(.iconOnly).help(model.t("panel.summaryScriptToggle"))
@@ -618,13 +618,76 @@ private struct RecentCardStyle: ViewModifier {
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(color.opacity(latest ? 1 : 0.30), lineWidth: latest ? 2 : 1))
     }
 }
+struct AdviceCardBody: View {
+    let advice: Advice
+    let fontSize: Double
+    var emphasized: Bool = false
+    var inverted: Bool = false
+
+    var body: some View {
+        if let src = advice.sourceLanguageText, let dst = advice.targetLanguageText, !src.isEmpty, !dst.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(advice.sourceLanguageName ?? "STT", systemImage: "mic.fill")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(inverted ? Color.white.opacity(0.18) : Color.blue.opacity(0.14), in: Capsule())
+                        .foregroundStyle(inverted ? Color.white : Color.blue)
+                    Text(src)
+                        .font(.system(size: fontSize, weight: emphasized ? .medium : .regular))
+                        .lineSpacing(4)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Divider()
+                    .overlay(inverted ? Color.white.opacity(0.25) : Color.secondary.opacity(0.25))
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(advice.targetLanguageName ?? "번역", systemImage: "character.bubble")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(inverted ? Color.white.opacity(0.18) : Color.purple.opacity(0.14), in: Capsule())
+                        .foregroundStyle(inverted ? Color.white : Color.purple)
+                    Text(dst)
+                        .font(.system(size: fontSize, weight: emphasized ? .medium : .regular))
+                        .lineSpacing(4)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        } else {
+            Text(advice.text)
+                .font(.system(size: fontSize, weight: emphasized ? .medium : .regular))
+                .lineSpacing(5)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 struct CoachView: View {
     @ObservedObject var model: AppModel
     @State private var showHistory = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack { Label(model.t("panel.coach"), systemImage: "sparkles").font(.headline); Spacer(); if !model.followLive { Button(model.t("reading.resume")) { model.resumeReading() }.font(.caption) }; if model.generating { ProgressView().controlSize(.small) } }
-            Toggle("자동 답변 · 조언", isOn: $model.autoAdvice).font(.caption)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Label(model.t("panel.coach"), systemImage: "sparkles").font(.headline)
+                Text(model.coachLanguageSummary)
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if !model.followLive { Button(model.t("reading.resume")) { model.resumeReading() }.font(.caption) }
+                if model.generating { ProgressView().controlSize(.small) }
+            }
+            HStack(spacing: 12) {
+                Toggle("자동 답변 · 조언", isOn: $model.autoAdvice).font(.caption)
+                Toggle("STT + 번역 동시 코칭", isOn: $model.bilingualCoach)
+                    .font(.caption)
+                    .help("STT 인식 언어와 번역 언어 두 가지로 답변과 조언을 함께 생성합니다.")
+            }
             Toggle("전체 조언 기록", isOn: $showHistory).font(.caption)
             let showAll = showHistory || model.recentSeconds == 0
             TimelineView(LiveActivitySchedule(active: model.listening && model.followLive && !showAll)) { timeline in
@@ -653,7 +716,12 @@ struct CoachView: View {
                             if let conversation = model.displayConversation {
                                 LinkBadge(model: model, spans: ConversationLinks.spans(for: advice, in: conversation), context: true)
                             }
-                            Text(advice.text).font(.system(size: model.panelTypography.advice + (advice.id == adviceItems.last?.id ? 1 : 0), weight: advice.id == adviceItems.last?.id ? .medium : .regular)).lineSpacing(5).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            AdviceCardBody(
+                                advice: advice,
+                                fontSize: model.panelTypography.advice + (advice.id == adviceItems.last?.id ? 1 : 0),
+                                emphasized: advice.id == adviceItems.last?.id,
+                                inverted: latest
+                            )
                         }.padding(14).modifier(RecentCardStyle(color: LiveColors.coach, latest: latest))
                         .id(advice.id)
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.orange, lineWidth: model.displayConversation.map { ConversationLinks.spans(for: advice, in: $0).contains { $0.id == model.selectedLiveBlockID } } == true ? 3 : 0))

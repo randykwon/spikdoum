@@ -19,7 +19,9 @@ struct ManagedServerStatus {
 }
 
 @MainActor final class ManagedModelManager: ObservableObject {
+    private static let customModelsKey = "customManagedModelsV1"
     @Published private(set) var installed: Set<String> = []
+    @Published private(set) var customModels: [CustomManagedModel] = []
     @Published private(set) var transfers: [String: ModelTransfer] = [:]
     @Published private(set) var servers: [ManagedRole: ManagedServerStatus] = [:]
     @Published private(set) var logs: [ManagedRole: String] = [:]
@@ -45,6 +47,10 @@ struct ManagedServerStatus {
         self.runtimeRoot = runtimeRoot ?? (Bundle.main.resourceURL ?? URL(fileURLWithPath: ".")).appendingPathComponent("ManagedRuntime")
         selectedSTT = defaults.string(forKey: "managedSTTModel") ?? "whisper-base"
         selectedTranslation = defaults.string(forKey: "managedTranslationModel") ?? "qwen25-15b-q4"
+        if let data = defaults.data(forKey: Self.customModelsKey),
+           let loaded = try? JSONDecoder().decode([CustomManagedModel].self, from: data) {
+            customModels = loaded
+        }
         refreshInstalled()
         monitor = Task { [weak self] in
             while !Task.isCancelled {
@@ -54,8 +60,55 @@ struct ManagedServerStatus {
             }
         }
     }
-    func selected(_ role: ManagedRole) -> ManagedModel? { ManagedModelCatalog.model(role == .stt ? selectedSTT : selectedTranslation) }
-    func refreshInstalled() { installed = Set(ManagedModelCatalog.all.filter { store.installed($0) }.map(\.id)) }
+    var allModels: [ManagedModel] {
+        ManagedModelCatalog.all + customModels.map(\.asManagedModel)
+    }
+    func models(for role: ManagedRole) -> [ManagedModel] {
+        allModels.filter { $0.role == role }
+    }
+    func selected(_ role: ManagedRole) -> ManagedModel? {
+        let id = role == .stt ? selectedSTT : selectedTranslation
+        return allModels.first { $0.id == id }
+    }
+    func refreshInstalled() {
+        installed = Set(allModels.filter { store.installed($0) }.map(\.id))
+    }
+    @discardableResult
+    func importCustomModel(from sourceURL: URL, role: ManagedRole) throws -> ManagedModel {
+        let ext = sourceURL.pathExtension.lowercased()
+        let required = role.customFileExtension
+        guard ext == required else {
+            throw CloudFailure(message: "\(role.title) 모델은 .\(required) 파일만 추가할 수 있습니다.")
+        }
+        let attrs = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0 else { throw CloudFailure(message: "비어 있는 모델 파일은 추가할 수 없습니다.") }
+
+        let customFolder = store.root.appendingPathComponent("custom")
+        try FileManager.default.createDirectory(at: customFolder, withIntermediateDirectories: true)
+        let sanitizedBase = sourceURL.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+        let uniqueFilename = "\(sanitizedBase.isEmpty ? "model" : sanitizedBase)-\(UUID().uuidString.prefix(6)).\(required)"
+        let destination = customFolder.appendingPathComponent(uniqueFilename)
+        try FileManager.default.copyItem(at: sourceURL, to: destination)
+
+        let entry = CustomManagedModel(
+            id: "custom-\(role.rawValue)-\(UUID().uuidString.prefix(8).lowercased())",
+            name: sourceURL.deletingPathExtension().lastPathComponent,
+            role: role,
+            filename: uniqueFilename,
+            bytes: size
+        )
+        customModels.append(entry)
+        saveCustomModels()
+        refreshInstalled()
+        return entry.asManagedModel
+    }
+    private func saveCustomModels() {
+        if let data = try? JSONEncoder().encode(customModels) {
+            defaults.set(data, forKey: Self.customModelsKey)
+        }
+    }
     func select(_ model: ManagedModel) async {
         guard installed.contains(model.id) else { lastError = "모델을 먼저 다운로드해주세요."; return }
         if selected(model.role)?.id != model.id { await stop(model.role) }
@@ -85,7 +138,19 @@ struct ManagedServerStatus {
     func cancelDownload(_ id: String) { downloads[id]?.cancel() }
     func remove(_ model: ManagedModel) async {
         if selected(model.role)?.id == model.id { await stop(model.role) }
-        do { try store.remove(model); refreshInstalled() } catch { lastError = error.localizedDescription }
+        do {
+            try store.remove(model)
+            if model.isCustom {
+                customModels.removeAll { $0.id == model.id }
+                saveCustomModels()
+                if model.role == .stt && selectedSTT == model.id {
+                    selectedSTT = "whisper-base"; defaults.set(selectedSTT, forKey: "managedSTTModel")
+                } else if model.role == .translation && selectedTranslation == model.id {
+                    selectedTranslation = "qwen25-15b-q4"; defaults.set(selectedTranslation, forKey: "managedTranslationModel")
+                }
+            }
+            refreshInstalled()
+        } catch { lastError = error.localizedDescription }
     }
     func ensureReady(_ role: ManagedRole) async throws {
         if let starting = starts[role] { return try await starting.value }
@@ -162,7 +227,7 @@ struct ManagedServerStatus {
     }
     nonisolated static func arguments(role: ManagedRole, model: URL) -> [String] {
         let common = ["-m", model.path, "--host", "127.0.0.1", "--port", String(role.port)]
-        return role == .stt ? common + ["-l", "auto", "-nt", "-t", "4"] : common + ["-c", "4096", "-ngl", "99", "-t", "4", "--parallel", "1"]
+        return role == .stt ? common + ["-l", "auto", "-nt", "-t", "4"] : common + ["-c", "4096", "-ngl", "99", "-t", "4", "--parallel", "1", "--reasoning", "off"]
     }
     func stop(_ role: ManagedRole) async {
         if servers[role]?.phase == .stopping { return }
@@ -203,7 +268,14 @@ struct ManagedServerStatus {
         let start = Date()
         let result = try await LocalTranslator(settings: settings, key: authorization(.translation)).translate(text, source: source, target: target)
         record(.translation, latency: Int(Date().timeIntervalSince(start) * 1000))
-        return result
+        return Self.stripThinkingTags(result)
+    }
+    nonisolated static func stripThinkingTags(_ text: String) -> String {
+        var cleaned = text
+        while let open = cleaned.range(of: "<think>"), let close = cleaned.range(of: "</think>", range: open.upperBound..<cleaned.endIndex) {
+            cleaned.removeSubrange(open.lowerBound..<close.upperBound)
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     func record(_ role: ManagedRole, latency: Int) { servers[role]?.requests += 1; servers[role]?.lastLatencyMS = latency }
     func poll() async {

@@ -14,6 +14,14 @@ struct EngineSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack { Text(model.t("settings.title")).font(.title2.bold()); Spacer(); Button(model.t("action.done")) { dismiss() } }
+            if model.listening {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform").foregroundStyle(.green)
+                    Text("듣기 중에도 설정을 변경할 수 있습니다. 마이크·STT 엔진 변경 시 자동으로 재연결됩니다.")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             Form {
                 Section(model.t("settings.uiLanguage")) {
                     Picker(model.t("settings.uiLanguage"), selection: $model.interfaceLanguage) {
@@ -51,9 +59,10 @@ struct EngineSettingsView: View {
                     Text("모델 다운로드 후 적용하면 별도 설치 없이 이 Mac에서 서버를 실행합니다.").font(.caption).foregroundStyle(.secondary)
                 }
                 Section("듣기 · 장치 · 추천 설정") { CaptureOptionsView(model: model) }
-                Section("번역 옆 키워드") {
+                Section("번역 옆 키워드 · 대화 코치") {
                     Toggle("키워드를 번역 패널에 함께 표시", isOn: $model.showTranslationKeywords)
                     Toggle("자동 답변 · 조언", isOn: $model.autoAdvice)
+                    Toggle("대화 코치 2개 언어 동시 출력 (STT 언어 + 번역 언어)", isOn: $model.bilingualCoach)
                 }
                 Section("패널 글자 크기") { PanelFontControls(model: model) }
                 Section("STT 보기 스타일") { STTAppearanceControls(model: model) }
@@ -119,7 +128,7 @@ struct EngineSettingsView: View {
             }
         }.padding(24).frame(width: 680, height: 760)
             .sheet(isPresented: $showingModels) { ManagedModelsView(model: model, manager: model.managedModels) }
-            .disabled(model.listening || model.starting)
+            .disabled(model.starting)
             .onAppear {
                 deepgramKey = SecretStore.read("deepgram"); azureKey = SecretStore.read("azure")
                 openAIKey = SecretStore.read("openai"); localKey = SecretStore.read("local")

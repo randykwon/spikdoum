@@ -151,7 +151,7 @@ struct MenuBarTrayView: View {
                     presetButton("Zoom", preset: .zoom)
                     presetButton(model.t("preset.inPerson"), preset: .inPerson)
                 }
-                .disabled(model.listening || model.starting)
+                .disabled(model.starting)
                 Text(model.captureSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
 

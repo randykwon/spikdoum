@@ -38,6 +38,7 @@ enum AppStorageMigration {
             "autoStartListeningOnNewConversation",
             "recentActivitySeconds",
             "automaticAdvice",
+            "bilingualCoach",
             "inputDeviceUID",
             "interfaceLanguage",
             "recognitionLanguage",
