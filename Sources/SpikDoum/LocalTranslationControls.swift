@@ -12,7 +12,7 @@ struct LocalTranslationControls: View {
             TextField("번역 API 주소", text: $model.settings.localTranslation.endpoint)
             SecureField("번역 서버 Bearer API 키 (선택)", text: $key)
             Stepper("응답 대기: \(Int(model.settings.localTranslation.timeout))초", value: $model.settings.localTranslation.timeout, in: 5...120, step: 5)
-            Text("원문 묶음을 이 주소로 POST하여 한국어 번역을 받습니다. 조언·요약의 LLM 설정과 별도로 사용합니다.")
+            Text("원문 묶음을 이 주소로 POST하여 선택한 출력 언어의 번역을 받습니다. 조언·요약의 LLM 설정과 별도로 사용합니다.")
                 .font(.caption).foregroundStyle(.secondary)
             DisclosureGroup("API 요청 · 응답 형식") {
                 VStack(alignment: .leading, spacing: 8) {

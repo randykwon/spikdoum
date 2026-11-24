@@ -15,6 +15,7 @@ struct TranslationEntry: Codable, Identifiable {
     var date: Date? = Date()
     var translated: String
     var engine: String? = "apple-translation-v1"
+    var targetLanguage: String? = nil
     var sourceStart: Int? = nil
     var sourceEnd: Int? = nil
 }

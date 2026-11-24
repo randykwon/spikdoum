@@ -47,7 +47,7 @@ struct MenuBarTrayView: View {
                     Menu(model.t("settings.targetLanguage")) {
                         ForEach(LanguageCatalog.all) { lang in
                             Button {
-                                model.targetLanguage = lang.code
+                                model.selectTargetLanguage(lang.code)
                             } label: {
                                 if model.targetLanguage == lang.code {
                                     Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")

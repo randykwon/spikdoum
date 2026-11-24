@@ -21,7 +21,7 @@ extension AppModel {
         }
         guard !translating, let item = current, item.archivedAt == nil else { return }
         let flush = !automatic || !listening || TranslationPolicy.shouldFlush(now: Date(), lastChange: lastTranscriptChange, batchStarted: translationBatchStartedAt)
-        let work = TranslationPolicy.plan(transcript: stableCloudTranscript ?? item.transcript, entries: item.translations ?? [], flush: flush)
+        let work = TranslationPolicy.plan(transcript: stableCloudTranscript ?? item.transcript, entries: item.translations ?? [], flush: flush, targetLanguage: targetLanguage)
         if let index = conversations.firstIndex(where: { $0.id == item.id }),
            conversations[index].translations?.count != work.retained.count {
             conversations[index].translations = work.retained
@@ -38,11 +38,12 @@ extension AppModel {
             translationBatchStartedAt = nil
             return
         }
+        let cleanedSource = TranslationPolicy.preparedForTranslation(source)
         let token = UUID()
         translationToken = token
         translating = true
         translationSource = source
-        translationStatus = "새 원문 번역 중"
+        translationStatus = "새 원문 \(targetLanguageName) 번역 중"
         liveTranslation = ""
         translationError = nil
         translationTask = Task { [weak self] in
@@ -56,52 +57,41 @@ extension AppModel {
             }
             do {
                 let started = Date()
-                let detectedSpec = self.language == LanguageCatalog.autoCode ? (LanguageCatalog.detectLanguage(for: source) ?? self.detectedSTTLanguage) : self.sourceLanguageSpec
-                let sourceShort = detectedSpec?.shortCode ?? LanguageCatalog.whisperLanguageParameter(for: self.language)
                 let targetSpec = self.targetLanguageSpec
                 let translated: String
-                if self.settings.translation == .managed {
-                    translated = try await self.managedModels.translate(source, source: sourceShort, target: targetSpec.shortCode, targetName: targetSpec.englishName)
-                } else if self.settings.translation == .local {
-                    translated = try await LocalTranslator(settings: self.settings.localTranslation, key: SecretStore.read("translation-local")).translate(source, source: sourceShort, target: targetSpec.shortCode)
-                } else if self.settings.translation == .azure {
-                    translated = try await AzureTranslator(key: SecretStore.read("azure"), region: self.settings.azureRegion).translate(source, target: targetSpec.azureCode)
-                } else if let detectedSpec, detectedSpec.translationCode == targetSpec.translationCode {
-                    translated = source
+                if cleanedSource.isEmpty {
+                    translated = "…"
                 } else {
-                    let sourceCode = detectedSpec?.translationCode ?? "en"
-                    let targetCode = targetSpec.translationCode
-                    let cacheKey = "\(sourceCode)->\(targetCode)"
-                    let session: TranslationSession
-                    if let existing = self.nativeTranslationSessions[cacheKey] {
-                        session = existing
+                    let detectedSpec = self.language == LanguageCatalog.autoCode ? (LanguageCatalog.detectLanguage(for: cleanedSource) ?? self.detectedSTTLanguage) : self.sourceLanguageSpec
+                    let sourceShort = detectedSpec?.shortCode ?? LanguageCatalog.whisperLanguageParameter(for: self.language)
+                    if self.settings.translation == .managed {
+                        translated = try await self.managedModels.translate(cleanedSource, source: sourceShort, target: targetSpec.shortCode, targetName: targetSpec.englishName)
+                    } else if self.settings.translation == .local {
+                        translated = try await LocalTranslator(settings: self.settings.localTranslation, key: SecretStore.read("translation-local")).translate(cleanedSource, source: sourceShort, target: targetSpec.shortCode)
+                    } else if self.settings.translation == .azure {
+                        translated = try await AzureTranslator(key: SecretStore.read("azure"), region: self.settings.azureRegion).translate(cleanedSource, target: targetSpec.azureCode)
+                    } else if let detectedSpec, detectedSpec.translationCode == targetSpec.translationCode {
+                        translated = cleanedSource
                     } else {
-                        // Use the installed-model API directly. Readiness checks and UI-preparation
-                        // sessions can disagree about model strategies on some macOS versions.
-                        if #available(macOS 26.4, *) {
-                            session = TranslationSession(installedSource: Locale.Language(identifier: sourceCode), target: Locale.Language(identifier: targetCode), preferredStrategy: .highFidelity)
-                        } else {
-                            session = TranslationSession(installedSource: Locale.Language(identifier: sourceCode), target: Locale.Language(identifier: targetCode))
-                        }
-                        self.nativeTranslationSessions[cacheKey] = session
+                        let sourceCode = detectedSpec?.translationCode ?? "en"
+                        let targetCode = targetSpec.translationCode
+                        translated = try await self.translateWithApple(cleanedSource, sourceCode: sourceCode, targetCode: targetCode)
+                        guard self.translationToken == token, !Task.isCancelled else { return }
                     }
-                    let result = try await session.translate(source)
-                    guard self.translationToken == token, !Task.isCancelled else { return }
-                    translated = result.targetText
                 }
                 guard !Task.isCancelled, self.translationToken == token,
                       let index = self.conversations.firstIndex(where: { $0.id == item.id }) else { return }
                 guard !translated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CloudFailure(message: "번역 결과가 비어 있습니다.") }
                 self.liveTranslation = translated
                 guard TranslationPolicy.isCurrent(work, transcript: self.conversations[index].transcript) else {
-                    self.translationPreview = TranslationEntry(source: source, translated: self.liveTranslation)
+                    self.translationPreview = TranslationEntry(source: source, translated: self.liveTranslation, targetLanguage: targetSpec.code)
                     self.translationStatus = "원문 수정 반영 중 · 아래 번역은 표시된 원문 기준"
                     self.liveTranslation = ""
                     self.translationSource = ""
                     return
                 }
                 self.translationLatency = Int(Date().timeIntervalSince(started) * 1000)
-                let entry = TranslationEntry(source: source, translated: self.liveTranslation, sourceStart: work.start, sourceEnd: work.end)
+                let entry = TranslationEntry(source: source, translated: self.liveTranslation, targetLanguage: targetSpec.code, sourceStart: work.start, sourceEnd: work.end)
                 if self.conversations[index].translations == nil { self.conversations[index].translations = [] }
                 self.conversations[index].translations?.append(entry)
                 self.translationPreview = nil
@@ -160,6 +150,46 @@ extension AppModel {
             self.translateLatest(automatic: true)
         }
     }
+    private func translateWithApple(_ text: String, sourceCode: String, targetCode: String) async throws -> String {
+        let sourceLang = Locale.Language(identifier: sourceCode)
+        let targetLang = Locale.Language(identifier: targetCode)
+        if #available(macOS 26.4, *) {
+            // Prefer lowLatency (lightweight on-device NMT) so live translation stays fast and
+            // does not fail with ModelManagerError Code=1013 under CriticalMemoryPressure.
+            let fastKey = "\(sourceCode)->\(targetCode):low"
+            let fastSession: TranslationSession
+            if let existing = nativeTranslationSessions[fastKey] {
+                fastSession = existing
+            } else {
+                fastSession = TranslationSession(installedSource: sourceLang, target: targetLang, preferredStrategy: .lowLatency)
+                nativeTranslationSessions[fastKey] = fastSession
+            }
+            do {
+                return try await fastSession.translate(text).targetText
+            } catch {
+                nativeTranslationSessions.removeValue(forKey: fastKey)
+                let fallbackKey = "\(sourceCode)->\(targetCode):default"
+                let fallbackSession: TranslationSession
+                if let existing = nativeTranslationSessions[fallbackKey] {
+                    fallbackSession = existing
+                } else {
+                    fallbackSession = TranslationSession(installedSource: sourceLang, target: targetLang)
+                    nativeTranslationSessions[fallbackKey] = fallbackSession
+                }
+                return try await fallbackSession.translate(text).targetText
+            }
+        } else {
+            let cacheKey = "\(sourceCode)->\(targetCode)"
+            let session: TranslationSession
+            if let existing = nativeTranslationSessions[cacheKey] {
+                session = existing
+            } else {
+                session = TranslationSession(installedSource: sourceLang, target: targetLang)
+                nativeTranslationSessions[cacheKey] = session
+            }
+            return try await session.translate(text).targetText
+        }
+    }
     func prepareTranslationLanguages() {
         let sourceCode = sourceLanguageSpec?.translationCode ?? detectedSTTLanguage?.translationCode ?? "en"
         let targetCode = targetLanguageSpec.translationCode
@@ -170,7 +200,7 @@ extension AppModel {
             translationConfiguration?.invalidate()
         } else {
             if #available(macOS 26.4, *) {
-                translationConfiguration = TranslationSession.Configuration(source: source, target: target, preferredStrategy: .highFidelity)
+                translationConfiguration = TranslationSession.Configuration(source: source, target: target, preferredStrategy: .lowLatency)
             } else {
                 translationConfiguration = TranslationSession.Configuration(source: source, target: target)
             }

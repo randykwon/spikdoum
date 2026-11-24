@@ -18,6 +18,7 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(deletionMode.rawValue, forKey: "conversationDeletionMode") }
     }
     @Published var panelTypography = PanelTypography.load() { didSet { panelTypography.save() } }
+    @Published var panelLayout = PanelLayout.load() { didSet { panelLayout.save() } }
     @Published var sttAppearance = STTAppearance.load() { didSet { sttAppearance.save() } }
     @Published var settings = EngineSettings.load() { didSet { settings.save() } }
     @Published var systemAudioPermissionGranted = CGPreflightScreenCaptureAccess()
@@ -178,6 +179,11 @@ final class AppModel: ObservableObject {
             language = code
             detectedSTTLanguage = nil
         }
+        nativeTranslationSessions.removeAll()
+        translationRetryCount = 0
+        translationRetryAfter = .distantPast
+        translationError = nil
+        if !(current?.transcript.isEmpty ?? true) { scheduleTranslation() }
         guard listening else { return }
         if settings.stt == .managed && !engineSwitched {
             managedMic.updateLanguage(language)
@@ -186,6 +192,26 @@ final class AppModel: ObservableObject {
         } else {
             stop()
             Task { [weak self] in await self?.start() }
+        }
+    }
+    func selectTargetLanguage(_ code: String) {
+        guard code != targetLanguage else { return }
+        targetLanguage = code
+        translationDebounce?.cancel(); translationDebounce = nil
+        translationWatchdog?.cancel()
+        translationTask?.cancel()
+        translationToken = UUID()
+        translating = false
+        liveTranslation = ""
+        translationSource = ""
+        translationPreview = nil
+        translationBatchStartedAt = nil
+        translationRetryCount = 0
+        translationRetryAfter = .distantPast
+        translationError = nil
+        nativeTranslationSessions.removeAll()
+        if !(current?.transcript.isEmpty ?? true) {
+            translateLatest(automatic: false)
         }
     }
     @Published var targetLanguage = UserDefaults.standard.string(forKey: "targetLanguage") ?? "ko-KR" {

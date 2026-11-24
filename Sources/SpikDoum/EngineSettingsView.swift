@@ -39,7 +39,10 @@ struct EngineSettingsView: View {
                             }
                         }
                     }
-                    Picker(model.t("settings.targetLanguage"), selection: $model.targetLanguage) {
+                    Picker(model.t("settings.targetLanguage"), selection: Binding(
+                        get: { model.targetLanguage },
+                        set: { model.selectTargetLanguage($0) }
+                    )) {
                         ForEach(model.targetLanguages, id: \.0) { code, name in Text(name).tag(code) }
                     }
                 }

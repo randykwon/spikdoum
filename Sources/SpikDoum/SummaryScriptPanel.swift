@@ -307,13 +307,23 @@ struct SummaryScriptPanel: View {
 
     var body: some View {
         VSplitView {
-            SummaryPanel(model: model)
-                .padding(.bottom, 10)
-                .frame(minHeight: 160, idealHeight: 230)
+            if model.panelLayout.summaryScriptReversed {
+                fullScriptSection
+                    .padding(.bottom, 10)
+                    .frame(minHeight: 220, maxHeight: .infinity)
 
-            fullScriptSection
-                .padding(.top, 10)
-                .frame(minHeight: 220, maxHeight: .infinity)
+                SummaryPanel(model: model)
+                    .padding(.top, 10)
+                    .frame(minHeight: 160, idealHeight: 230)
+            } else {
+                SummaryPanel(model: model)
+                    .padding(.bottom, 10)
+                    .frame(minHeight: 160, idealHeight: 230)
+
+                fullScriptSection
+                    .padding(.top, 10)
+                    .frame(minHeight: 220, maxHeight: .infinity)
+            }
         }
     }
 

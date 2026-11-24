@@ -510,3 +510,54 @@ import Testing
     #expect(LanguageCatalog.detectLanguage(for: "[Mac 재생음] Bonjour tout le monde, comment allez-vous aujourd'hui?")?.code == "fr-FR")
     #expect(LanguageCatalog.detectLanguage(for: "[마이크] ok") == nil)
 }
+
+@Test func panelLayoutReordersPersistsNormalizesAndResetsCleanly() throws {
+    let suiteName = "SpikDoum.PanelLayoutTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    var layout = PanelLayout(splitOrder: [.translation, .translation, .stt])
+    #expect(layout.splitOrder == [.translation, .stt, .coach, .summaryScript])
+
+    // Drag-and-drop reorder: move summaryScript to the leftmost slot.
+    layout.move(.summaryScript, to: .translation)
+    #expect(layout.splitOrder == [.summaryScript, .translation, .stt, .coach])
+
+    // Arrow move skips hidden summaryScript when includeSummaryScript is false.
+    layout.move(.translation, by: 1, includeSummaryScript: false)
+    #expect(layout.splitOrder == [.summaryScript, .stt, .translation, .coach])
+
+    layout.swapLinkedSide()
+    layout.toggleSummaryScriptOrder()
+    layout.save(defaults: defaults)
+
+    let reloaded = PanelLayout.load(defaults: defaults)
+    #expect(reloaded == layout)
+    #expect(reloaded.linkedSummaryOnLeft)
+    #expect(reloaded.summaryScriptReversed)
+
+    layout.reset()
+    #expect(layout.splitOrder == PanelLayout.defaultOrder)
+    #expect(!layout.linkedSummaryOnLeft)
+    #expect(!layout.summaryScriptReversed)
+}
+
+@Test func targetLanguageSwitchInvalidatesOldTranslationsAndWhisperNoiseIsCleaned() {
+    let source = "おはようございます。今日はいい天気ですね。"
+    let koreanEntry = TranslationEntry(source: source, translated: "좋은 아침입니다. 오늘 날씨가 좋네요.", targetLanguage: "ko-KR", sourceStart: 0, sourceEnd: source.count)
+    let legacyEntry = TranslationEntry(source: source, translated: "좋은 아침입니다.", targetLanguage: nil, sourceStart: 0, sourceEnd: source.count)
+
+    // Keeping same target language retains existing entries.
+    #expect(TranslationPolicy.retained(transcript: source, entries: [koreanEntry], targetLanguage: "ko-KR").entries.count == 1)
+    #expect(TranslationPolicy.retained(transcript: source, entries: [legacyEntry], targetLanguage: "ko-KR").entries.count == 1)
+
+    // Switching to English translation invalidates Korean entries so they re-translate into English.
+    let switched = TranslationPolicy.plan(transcript: source, entries: [koreanEntry], flush: true, targetLanguage: "en-US")
+    #expect(switched.retained.isEmpty)
+    #expect(switched.source == source)
+
+    // Whisper non-speech noise and fragmented lines are cleaned before Apple Translation.
+    let noisy = "[Mac 재생음] [BLANK_AUDIO]\n(snoring)\n[Bell]\n(音楽)\n[Mac 재생음] おはようございます。\n今日はいい天気ですね。\n(笑)"
+    #expect(TranslationPolicy.preparedForTranslation(noisy) == "おはようございます。 今日はいい天気ですね。")
+    #expect(TranslationPolicy.preparedForTranslation("[BLANK_AUDIO]\n(音楽)\n(拍手)").isEmpty)
+}

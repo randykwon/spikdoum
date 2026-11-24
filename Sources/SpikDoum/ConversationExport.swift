@@ -85,7 +85,7 @@ enum ConversationExport {
         let blocks = ConversationBlocks.make(conversation)
         if !blocks.isEmpty {
             lines.append("")
-            lines.append("## 대화 원문 및 한국어 번역")
+            lines.append("## 대화 원문 및 번역")
             for block in blocks {
                 lines.append("")
                 lines.append("### 묶음 #\(block.ordinal)")

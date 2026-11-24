@@ -28,6 +28,7 @@ enum AppStorageMigration {
         let appKeys = [
             "conversationDeletionMode",
             "panelTypography",
+            "panelLayoutOrderV1",
             "sttAppearance",
             "engineSettings",
             "meetingAudioTarget",

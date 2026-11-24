@@ -84,6 +84,7 @@ struct ContentView: View {
     @State private var pendingDeletion: Set<UUID> = []
     @State private var selectingConversations = false
     @State private var selectedConversations: Set<UUID> = []
+    @State private var dropTargetPanel: String?
     private var visibleSelection: Set<UUID> { selectedConversations.intersection(visibleConversations.map(\.id)) }
     private var deletionDescription: String {
         let titles = model.conversations.filter { pendingDeletion.contains($0.id) }.prefix(3).map(\.title).joined(separator: "\n")
@@ -93,6 +94,62 @@ struct ContentView: View {
     private func requestRemoval(_ id: UUID) {
         if model.deletionMode == .archive { model.archiveConversation(id) }
         else { pendingDeletion = [id] }
+    }
+    @ViewBuilder
+    private func splitPanelContent(for panel: WorkspacePanelKind) -> some View {
+        switch panel {
+        case .stt:
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Label(model.listening ? model.t("panel.sttLive") : model.t("panel.stt"), systemImage: "mic.fill").font(.title3.bold()).foregroundStyle(.blue)
+                    Spacer(minLength: 4)
+                    Menu {
+                        Button {
+                            model.selectSTTLanguage(LanguageCatalog.autoCode)
+                        } label: {
+                            if model.isAutoDetectLanguage {
+                                Label(model.t("stt.mode.auto"), systemImage: "checkmark")
+                            } else {
+                                Label(model.t("stt.mode.auto"), systemImage: "sparkles")
+                            }
+                        }
+                        Divider()
+                        ForEach(LanguageCatalog.all) { lang in
+                            Button {
+                                model.selectSTTLanguage(lang.code)
+                            } label: {
+                                if !model.isAutoDetectLanguage && model.language == lang.code {
+                                    Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
+                                } else {
+                                    Text(lang.displayName(in: model.uiLanguage))
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(model.sttLanguageBadge, systemImage: model.isAutoDetectLanguage ? "sparkles" : "character.bubble")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(model.starting)
+                    .help(model.t("settings.sourceLanguage"))
+                }
+                Text(model.systemAudioOnly ? "Mac 재생음을 인식합니다." : "마이크를 사용합니다. 듣기 전 상대에게 알려주세요.").font(.caption).foregroundStyle(.secondary)
+                Text(model.speakerStatus).font(.caption).foregroundStyle(.secondary)
+                STTPanel(model: model)
+                Text("음성 인식은 기기 지원 여부에 따라 Apple 서버를 사용할 수 있습니다.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        case .translation:
+            TranslationView(model: model)
+        case .coach:
+            CoachView(model: model)
+        case .summaryScript:
+            SummaryScriptPanel(model: model)
+        }
     }
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -233,6 +290,13 @@ struct ContentView: View {
                         Toggle(model.t("panel.summaryScriptToggle"), isOn: $showSummaryScriptPanel)
                         Button(columnVisibility == .detailOnly ? model.t("panel.toggleSidebarShow") : model.t("panel.toggleSidebarHide")) { columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly }
                         Button(model.t("panel.coachWindow")) { openWindow(id: "coach") }
+                        Divider()
+                        Button(model.t("panel.swapVertical")) {
+                            withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() }
+                        }
+                        Button(model.t("panel.resetOrder")) {
+                            withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.reset() }
+                        }
                     } label: { Label("보기", systemImage: "rectangle.3.group") }.labelStyle(.iconOnly)
                     Button {
                         if model.listening { model.pauseListening() } else { Task { await model.start() } }
@@ -329,7 +393,7 @@ struct ContentView: View {
                         Section(model.t("settings.targetLanguage")) {
                             ForEach(LanguageCatalog.all) { lang in
                                 Button {
-                                    model.targetLanguage = lang.code
+                                    model.selectTargetLanguage(lang.code)
                                 } label: {
                                     if model.targetLanguage == lang.code {
                                         Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
@@ -368,62 +432,127 @@ struct ContentView: View {
                     } label: { Label(model.followLive ? model.t("reading.pause") : model.t("reading.resume"), systemImage: model.followLive ? "pause.circle" : "arrow.down.to.line") }
                 }.controlSize(.small)
                 if linkedConversationView {
+                    let linkedSides: [String] = showSummaryScriptPanel
+                        ? (model.panelLayout.linkedSummaryOnLeft ? ["linked-summary", "linked-main"] : ["linked-main", "linked-summary"])
+                        : ["linked-main"]
                     HSplitView {
-                        LinkedConversationView(model: model).frame(minWidth: 540, minHeight: 300)
-                        if showSummaryScriptPanel {
-                            SummaryScriptPanel(model: model).frame(minWidth: 300, idealWidth: 380).padding(.leading, 12)
+                        ForEach(Array(linkedSides.enumerated()), id: \.element) { index, side in
+                            let isFirst = index == 0
+                            let isLast = index == linkedSides.count - 1
+                            if side == "linked-summary" {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    PanelReorderBar(
+                                        title: model.t("panel.summaryScriptToggle"),
+                                        icon: "doc.text",
+                                        dragPayload: side,
+                                        canMoveLeft: !isFirst,
+                                        canMoveRight: !isLast,
+                                        moveLeftHelp: model.t("panel.moveLeft"),
+                                        moveRightHelp: model.t("panel.moveRight"),
+                                        dragHelp: model.t("panel.dragHint"),
+                                        onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
+                                        onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
+                                        extraActionIcon: "arrow.up.arrow.down",
+                                        extraActionHelp: model.t("panel.swapVertical"),
+                                        onExtraAction: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() } }
+                                    )
+                                    SummaryScriptPanel(model: model)
+                                }
+                                .frame(minWidth: 300, idealWidth: 380)
+                                .padding(.leading, isFirst ? 0 : 10)
+                                .padding(.trailing, isLast ? 0 : 10)
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == side ? 2 : 0))
+                                .dropDestination(for: String.self) { items, _ in
+                                    dropTargetPanel = nil
+                                    guard let dragged = items.first, dragged != side, dragged.hasPrefix("linked-") else { return false }
+                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() }
+                                    return true
+                                } isTargeted: { targeted in
+                                    dropTargetPanel = targeted ? side : (dropTargetPanel == side ? nil : dropTargetPanel)
+                                }
+                            } else {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    if showSummaryScriptPanel {
+                                        PanelReorderBar(
+                                            title: model.t("view.linked"),
+                                            icon: "rectangle.split.2x1",
+                                            dragPayload: side,
+                                            canMoveLeft: !isFirst,
+                                            canMoveRight: !isLast,
+                                            moveLeftHelp: model.t("panel.moveLeft"),
+                                            moveRightHelp: model.t("panel.moveRight"),
+                                            dragHelp: model.t("panel.dragHint"),
+                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
+                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } }
+                                        )
+                                    }
+                                    LinkedConversationView(model: model)
+                                }
+                                .frame(minWidth: 540, minHeight: 300)
+                                .padding(.leading, isFirst ? 0 : 10)
+                                .padding(.trailing, isLast ? 0 : 10)
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == side ? 2 : 0))
+                                .dropDestination(for: String.self) { items, _ in
+                                    dropTargetPanel = nil
+                                    guard let dragged = items.first, dragged != side, dragged.hasPrefix("linked-") else { return false }
+                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() }
+                                    return true
+                                } isTargeted: { targeted in
+                                    dropTargetPanel = targeted ? side : (dropTargetPanel == side ? nil : dropTargetPanel)
+                                }
+                            }
                         }
                     }.frame(minHeight: 300)
                 } else {
+                    let visiblePanels = model.panelLayout.visibleSplitPanels(includeSummaryScript: showSummaryScriptPanel)
                     HSplitView {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack(spacing: 6) {
-                                Label(model.listening ? model.t("panel.sttLive") : model.t("panel.stt"), systemImage: "mic.fill").font(.title3.bold()).foregroundStyle(.blue)
-                                Spacer(minLength: 4)
-                                Menu {
-                                    Button {
-                                        model.selectSTTLanguage(LanguageCatalog.autoCode)
-                                    } label: {
-                                        if model.isAutoDetectLanguage {
-                                            Label(model.t("stt.mode.auto"), systemImage: "checkmark")
-                                        } else {
-                                            Label(model.t("stt.mode.auto"), systemImage: "sparkles")
+                        ForEach(Array(visiblePanels.enumerated()), id: \.element) { index, panel in
+                            let isFirst = index == 0
+                            let isLast = index == visiblePanels.count - 1
+                            VStack(alignment: .leading, spacing: 6) {
+                                PanelReorderBar(
+                                    title: panel.title(in: model.uiLanguage),
+                                    icon: panel.icon,
+                                    dragPayload: panel.rawValue,
+                                    canMoveLeft: !isFirst,
+                                    canMoveRight: !isLast,
+                                    moveLeftHelp: model.t("panel.moveLeft"),
+                                    moveRightHelp: model.t("panel.moveRight"),
+                                    dragHelp: model.t("panel.dragHint"),
+                                    onMoveLeft: {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            model.panelLayout.move(panel, by: -1, includeSummaryScript: showSummaryScriptPanel)
                                         }
-                                    }
-                                    Divider()
-                                    ForEach(LanguageCatalog.all) { lang in
-                                        Button {
-                                            model.selectSTTLanguage(lang.code)
-                                        } label: {
-                                            if !model.isAutoDetectLanguage && model.language == lang.code {
-                                                Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
-                                            } else {
-                                                Text(lang.displayName(in: model.uiLanguage))
-                                            }
+                                    },
+                                    onMoveRight: {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            model.panelLayout.move(panel, by: 1, includeSummaryScript: showSummaryScriptPanel)
                                         }
-                                    }
-                                } label: {
-                                    Label(model.sttLanguageBadge, systemImage: model.isAutoDetectLanguage ? "sparkles" : "character.bubble")
-                                        .font(.caption2.bold())
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 3)
-                                        .background(Color.accentColor.opacity(0.12), in: Capsule())
-                                }
-                                .menuStyle(.borderlessButton)
-                                .fixedSize()
-                                .disabled(model.starting)
-                                .help(model.t("settings.sourceLanguage"))
+                                    },
+                                    extraActionIcon: panel == .summaryScript ? "arrow.up.arrow.down" : nil,
+                                    extraActionHelp: panel == .summaryScript ? model.t("panel.swapVertical") : nil,
+                                    onExtraAction: panel == .summaryScript ? {
+                                        withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() }
+                                    } : nil
+                                )
+                                splitPanelContent(for: panel)
                             }
-                            Text(model.systemAudioOnly ? "Mac 재생음을 인식합니다." : "마이크를 사용합니다. 듣기 전 상대에게 알려주세요.").font(.caption).foregroundStyle(.secondary)
-                            Text(model.speakerStatus).font(.caption).foregroundStyle(.secondary)
-                            STTPanel(model: model)
-                            Text("음성 인식은 기기 지원 여부에 따라 Apple 서버를 사용할 수 있습니다.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }.frame(minWidth: 220).padding(.trailing, 10)
-                        TranslationView(model: model).frame(minWidth: 220).padding(.horizontal, 10)
-                        CoachView(model: model).frame(minWidth: 220).padding(.horizontal, 10)
-                        if showSummaryScriptPanel {
-                            SummaryScriptPanel(model: model).frame(minWidth: 280, idealWidth: 360).padding(.leading, 10)
+                            .frame(minWidth: panel == .summaryScript ? 280 : 220, idealWidth: panel == .summaryScript ? 360 : nil)
+                            .padding(.leading, isFirst ? 0 : 10)
+                            .padding(.trailing, isLast ? 0 : 10)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == panel.rawValue ? 2 : 0))
+                            .dropDestination(for: String.self) { items, _ in
+                                dropTargetPanel = nil
+                                guard let payload = items.first,
+                                      let source = WorkspacePanelKind(rawValue: payload),
+                                      source != panel else { return false }
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    model.panelLayout.move(source, to: panel)
+                                }
+                                return true
+                            } isTargeted: { targeted in
+                                dropTargetPanel = targeted ? panel.rawValue : (dropTargetPanel == panel.rawValue ? nil : dropTargetPanel)
+                            }
                         }
                     }.frame(minHeight: 260)
                 }
@@ -552,9 +681,49 @@ struct TranslationView: View {
     @State private var showHistory = false
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 6) {
                 Label("\(model.targetLanguageName) \(model.t("panel.translation"))", systemImage: "character.bubble").font(.headline)
-                Spacer()
+                Spacer(minLength: 4)
+                HStack(spacing: 3) {
+                    Button {
+                        model.selectTargetLanguage("ko-KR")
+                    } label: {
+                        Text("한국어")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(model.targetLanguage == "ko-KR" ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.08), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        model.selectTargetLanguage("en-US")
+                    } label: {
+                        Text("EN")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(model.targetLanguage == "en-US" ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.08), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Menu {
+                        ForEach(LanguageCatalog.all) { lang in
+                            Button {
+                                model.selectTargetLanguage(lang.code)
+                            } label: {
+                                if model.targetLanguage == lang.code {
+                                    Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
+                                } else {
+                                    Text(lang.displayName(in: model.uiLanguage))
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help(model.t("settings.targetLanguage"))
+                }
                 if model.translating { ProgressView().controlSize(.small) }
             }
             if model.showTranslationKeywords { TranslationKeywordsView(model: model) }
@@ -586,7 +755,7 @@ struct TranslationView: View {
                             translationPair(source: model.translationSource, translated: model.liveTranslation.isEmpty ? "번역 중…" : model.liveTranslation)
                         }
                         if entries.isEmpty && !model.translating && model.translationPreview == nil {
-                            Text("대화의 한국어 번역이 여기에 표시됩니다.").foregroundStyle(.secondary).padding(.top, 20)
+                            Text("대화의 \(model.targetLanguageName) 번역이 여기에 표시됩니다.").foregroundStyle(.secondary).padding(.top, 20)
                         }
                         Color.clear.frame(height: 1).id("translation-end")
                     }.frame(maxWidth: .infinity, alignment: .leading)

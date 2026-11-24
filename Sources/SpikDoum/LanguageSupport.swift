@@ -201,6 +201,11 @@ enum L10n {
         "panel.toggleSidebarHide": [.ko: "대화 목록 접기", .en: "Hide Sidebar", .ja: "サイドバーを隠す", .zhHans: "收起对话列表"],
         "panel.focus": [.ko: "집중 모드", .en: "Focus Mode", .ja: "集中モード", .zhHans: "专注模式"],
         "panel.restoreLayout": [.ko: "화면 복원", .en: "Restore Layout", .ja: "表示を戻す", .zhHans: "恢复布局"],
+        "panel.resetOrder": [.ko: "패널 순서 초기화", .en: "Reset Panel Order", .ja: "パネル順をリセット", .zhHans: "重置面板顺序"],
+        "panel.moveLeft": [.ko: "왼쪽으로 이동", .en: "Move Left", .ja: "左へ移動", .zhHans: "向左移动"],
+        "panel.moveRight": [.ko: "오른쪽으로 이동", .en: "Move Right", .ja: "右へ移動", .zhHans: "向右移动"],
+        "panel.swapVertical": [.ko: "요약 · 스크립트 상하 전환", .en: "Swap Summary / Script Vertically", .ja: "要約・スクリプトの上下入替", .zhHans: "上下互换摘要与文稿"],
+        "panel.dragHint": [.ko: "드래그하여 다른 패널 위치로 이동", .en: "Drag to reorder this panel", .ja: "ドラッグしてパネル位置を移動", .zhHans: "拖动以调整面板位置"],
 
         // Keywords & Summary & Script
         "keywords.accumulated": [.ko: "누적 대화 키워드", .en: "Keywords", .ja: "累積キーワード", .zhHans: "累计关键词"],

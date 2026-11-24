@@ -41,9 +41,28 @@ struct LinkedConversationView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Label("번역 · 키워드", systemImage: "character.bubble").font(.headline).foregroundStyle(.purple)
-                        Spacer()
+                    HStack(spacing: 6) {
+                        Label("\(model.targetLanguageName) \(model.t("panel.translation"))", systemImage: "character.bubble").font(.headline).foregroundStyle(.purple)
+                        Spacer(minLength: 4)
+                        Menu {
+                            ForEach(LanguageCatalog.all) { lang in
+                                Button {
+                                    model.selectTargetLanguage(lang.code)
+                                } label: {
+                                    if model.targetLanguage == lang.code {
+                                        Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
+                                    } else {
+                                        Text(lang.displayName(in: model.uiLanguage))
+                                    }
+                                }
+                            }
+                        } label: {
+                            Text(model.targetLanguage == "en-US" ? "EN" : model.targetLanguageName)
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color.purple.opacity(0.14), in: Capsule())
+                        }
+                        .menuStyle(.borderlessButton).fixedSize().help(model.t("settings.targetLanguage"))
                         if model.translating { ProgressView().controlSize(.mini) }
                         Menu {
                             Button("번역 다시 시도") { model.translateLatest() }.disabled(model.translating)

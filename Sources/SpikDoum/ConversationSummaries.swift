@@ -9,11 +9,11 @@ struct SummaryState: Codable {
 
 @Generable
 struct ConversationDigest {
-    @Guide(description: "대화 내용을 대표하는 자연스러운 한국어 제목. 20자 이내.")
+    @Guide(description: "Natural title representing the conversation in the requested output language. Max 20 characters.")
     var title: String
-    @Guide(description: "대화 목록에서 보여줄 한국어 미리보기 요약. 80자 이내, 한두 문장.")
+    @Guide(description: "Brief preview summary for the conversation list in the requested output language. 1-2 sentences, max 80 characters.")
     var preview: String
-    @Guide(description: "이전 요약과 새 발언을 합친 누적 한국어 요약. 핵심 내용, 결정 사항, 할 일, 미해결 질문을 짧게 정리. 없는 정보는 만들지 않음.")
+    @Guide(description: "Cumulative summary combining previous summary and new speech in the requested output language. Concisely capture key points, decisions, action items, and open questions without inventing facts.")
     var summary: String
 }
 

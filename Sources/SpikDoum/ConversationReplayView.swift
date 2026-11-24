@@ -233,7 +233,7 @@ struct ConversationReplayView: View {
         let keywords = snapshot.allKeywords
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("한국어 번역 · 키워드", systemImage: "character.bubble").font(.headline).foregroundStyle(.purple)
+                Label("\(model.targetLanguageName) \(model.t("panel.translation")) · 키워드", systemImage: "character.bubble").font(.headline).foregroundStyle(.purple)
                 Spacer()
                 Text("\(entries.count)개").font(.caption2).foregroundStyle(.secondary)
             }
@@ -259,7 +259,7 @@ struct ConversationReplayView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         if entries.isEmpty {
-                            Text("이 시점까지 생성된 한국어 번역이 여기에 재현됩니다.")
+                            Text("이 시점까지 생성된 \(model.targetLanguageName) 번역이 여기에 재현됩니다.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .padding(.top, 12)
