@@ -1,179 +1,161 @@
-# SpikDoum
+<p align="center">
+  <img src="Resources/AppIcon.png" width="120" height="120" alt="SpikDoum App Icon" />
+</p>
 
-실시간 대화를 들으면서 음성 인식(STT), 한국어 번역, 키워드 추출, 다음 질문·표현 조언, 전체/화자별 누적 요약을 제공하는 macOS 앱입니다.
+<h1 align="center">SpikDoum</h1>
 
-## 실행
+<p align="center">
+  <strong>Real-time multilingual STT, live translation, bilingual AI conversation coaching, summaries, and time-synced replay for macOS</strong>
+</p>
 
-macOS 26 이상, Xcode 26 이상이 필요합니다. 기본 기기 내 AI(Apple Foundation Models)는 Apple Intelligence가 활성화된 Mac에서 동작하며, 설정에서 자체 모델 서버(Whisper·Qwen), Deepgram, Azure Translator, OpenAI 또는 내부망 OpenAI 호환 서버(Ollama/LM Studio/vLLM)를 독립적으로 선택할 수 있습니다.
+<p align="center">
+  <strong>English</strong> | <a href="README.ko.md">한국어</a>
+</p>
 
-```sh
+---
+
+**SpikDoum** is a native macOS app built with SwiftUI that listens to live conversations—via microphone, system audio (YouTube, Google Meet, Zoom), or both simultaneously—and delivers real-time speech-to-text (STT), live translation, bilingual AI coaching, accumulated keywords, structured summaries, AI-polished scripts, and synchronized audio replay.
+
+---
+
+## Highlights
+
+### 🎙️ Speech Recognition (STT)
+- **Auto-Detect or Specific Language (12 Languages)**: Switch seamlessly between **Auto-Detect** and 12 languages (`en-US`, `ko-KR`, `ja-JP`, `zh-CN`, `zh-TW`, `es-ES`, `fr-FR`, `de-DE`, `pt-BR`, `it-IT`, `ru-RU`, `vi-VN`)—even **while live listening is active**.
+- **3 Independent STT Engines**:
+  - **Bundled Managed Whisper (`whisper.cpp` Metal GPU)**: Runs 100% locally with silence-boundary / 3s chunking and 9 verified downloadable models (`Tiny` → `Large v3 Turbo Q5/Q8` → `Large v3 Q5`), plus custom local `.bin` model import.
+  - **Apple Speech Recognition**: On-device/Apple speech with resilient session rotation, transient error recovery, and local CAMPPlus speaker diarization (`SpeakerWorker`).
+  - **Deepgram Nova-3**: Streaming multilingual STT with `v1` diarization.
+- **Flexible Audio Capture & Presets**:
+  - **In-Person (Mic only)**, **YouTube / Mac Audio Only** (ScreenCaptureKit), **Google Meet** (Chrome / Safari / Edge / Firefox + Mic), and **Zoom** (Zoom App + Mic).
+  - Automatic fallback to the system default microphone if a previously saved Bluetooth/USB mic is disconnected.
+
+### 🌐 Real-Time Translation & Multilingual UI
+- **Live UI Localization**: Instant in-app UI language switching (`System Default`, `한국어`, `English`, `日本語`, `简体中文`) with no restart required.
+- **One-Click Korean / English / 12-Language Translation**: Switch translation output language directly in the Translation panel (`한국어` / `EN` / 12 languages) with automatic re-translation of the current conversation.
+- **4 Translation Engines**:
+  - **Apple Translation**: On-device translation with low-latency NMT priority and automatic fallback.
+  - **Bundled Managed Local LLM (`llama.cpp` Metal GPU)**: 10 verified downloadable GGUF models (`Qwen2.5 0.5B/1.5B/3B/7B`, `Qwen3 1.7B/4B`, `Gemma 2 2B`, `Gemma 3 4B/12B`, `Llama 3.2 3B`) + custom local `.gguf` import.
+  - **Azure Translator**: Automatic source-language detection.
+  - **Custom Local Translation API**: Configurable POST endpoint, JSON template, and response path.
+
+### ✨ Bilingual Conversation Coach, Summary & Full Script
+- **Simultaneous Bilingual Coaching**: Generates suggested replies and actionable advice in **both the STT spoken language and your translation language** at the same time (e.g., `English + Korean` or `Japanese + Korean`), powered by **Apple Intelligence (`FoundationModels`)**, **OpenAI API**, or any **OpenAI-compatible server** (Ollama / LM Studio / vLLM).
+- **CJK-Aware Context Budgeting**: Automatically fits long Korean/Japanese/Chinese conversations safely inside Apple FoundationModels' 4,096-token context window with automatic overflow retry.
+- **Accumulated Keywords**: Newest-first keyword cards extracted alongside translations.
+- **Right-Side Summary & Full Script Panel**: Cumulative overall/per-speaker summaries with history, paragraph-grouped transcripts, and incremental **AI Paragraph Polishing** (`문단 정리` / `원문+번역` / `번역만` / `원문만`).
+
+### 🪟 Customizable Workspace, Tray & Replay
+- **Movable Drag-and-Drop Panels**: Reorder all workspace panels (`STT`, `Translation`, `Coach`, `Summary & Script`) by dragging their top handle bar or clicking `‹` / `›`, flip Summary/Script vertically (`⇅`), and persist layout automatically.
+- **Change Settings While Listening**: Open App Settings, Capture Settings, Model Manager, or Tray Presets during an active session—translation/LLM changes apply immediately without stopping STT, while mic/STT engine changes coalesce and reconnect automatically.
+- **macOS Menu Bar Tray**: Quick dragonfly tray icon on the right menu bar for instant Start/Stop, New Conversation, language & preset switching, recent chats, and Launch at Login (`SMAppService`).
+- **Full Audio Recording & Time-Synced Replay**: Optional dual-source AAC (`.m4a`) recording stored locally per conversation with timeline scrubbing (`⌘R`) that replays STT, translations, keywords, advice, and summaries in sync with audio.
+
+---
+
+## Requirements
+
+- **Apple Silicon Mac (`arm64`)**
+- **macOS 26.0+** and **Xcode 26+** (for building from source)
+- *(Optional)* Python 3.9+ and CMake if rebuilding the bundled `SpeakerWorker` or `whisper-server` / `llama-server` runtimes from scratch
+
+---
+
+## Build & Run
+
+### 1. One-Time Local Code Signing Setup (Recommended)
+Creates and trusts a local `"SpikDoum Dev"` signing certificate so macOS Microphone, Speech Recognition, and Screen & System Audio permissions persist across rebuilds:
+
+```zsh
+./scripts/setup-signing.sh
+```
+
+### 2. Full App Bundle Build
+Builds `SpeakerWorker`, Metal-enabled `whisper-server` / `llama-server`, compiles the release Swift binary, bundles `dist/SpikDoum.app`, and signs it:
+
+```zsh
 ./scripts/build-app.sh
 open dist/SpikDoum.app
 ```
 
-`듣기 시작`을 눌러 마이크·음성 인식(필요 시 화면 및 시스템 오디오 기록) 권한을 허용하세요. 상대에게 수집 사실을 알린 뒤 사용하세요. `듣기 설정`에서 상대방 언어(영어·일본어·중국어·한국어·스페인어·프랑스어), 추천 설정(유튜브·Google Meet·Zoom·대면 대화), 입출력 디바이스를 고를 수 있으며 선택은 다음 실행에도 유지됩니다. `지금 조언 받기` 또는 앱 내 `⌘Return`으로 수동 요청하고, `스페이스`로 읽기 고정과 최신 보기를 전환하며, `⌘E`로 대화를 Markdown으로 내보낼 수 있습니다. `작은 조언창`은 다른 창 위에 표시됩니다.
+### 3. Fast Incremental Rebuild (After Swift Code Changes)
 
-## 데이터
+```zsh
+./scripts/quick-rebuild.sh
+```
 
-대화 원문·번역·조언·키워드·요약은 `~/Library/Application Support/SpikDoum/conversations.json`에 백그라운드 직렬 저장으로 기록합니다. 원본 음성은 앱에서 저장하지 않습니다. API 키는 macOS 키체인에 보관합니다. 저장된 대화는 사이드바에서 검색·아카이빙·복원·완전 삭제하거나 Markdown(`.md`)으로 내보낼 수 있습니다.
+### 4. Create Distributable DMG
 
-## 주요 기능 및 제한
+```zsh
+./scripts/build-dmg.sh
+```
 
-- **STT**: Apple 음성 인식(기기 내/서버), Deepgram Nova-3(다국어·화자 구분), 앱 내 자체 Whisper 서버(무음 경계/최대 3초 청킹)
-- **오디오 수집**: 마이크 단독, 마이크 + Mac 재생음(AirPods/이어폰 통화 모드, Google Meet 브라우저·Zoom 앱 타깃), Mac 재생음 전용(유튜브 등)
-- **번역**: Apple 전용 번역, Azure Translator(언어 자동 감지), 외부 로컬 LLM 번역 API, 앱 내 자체 Qwen2.5 번역 서버 (2~3문장 묶음 및 원문 행 정렬)
-- **코칭·정리**: Apple Intelligence / OpenAI / OpenAI 호환 서버 기반 실시간 답변·조언(중복 억제), 핵심 키워드, 전체/화자별 누적 요약 및 요약 이력
-- **제한**: 앱 내 단축키만 지원(전역 단축키 미지원), 저장 파일 별도 암호화 없음, 외부 노트/문서 자동 검색(RAG)은 미구현
+---
 
-## 검증
+## Installing on Another Mac
 
-```sh
+`dist/SpikDoum.app` (~185 MB) is self-contained with zero Homebrew or external Python dependencies.
+
+- **Supported targets**: Apple Silicon (`arm64`) Macs running **macOS 26.0+**.
+- **Without Apple Notarization (personal / team sharing)**:
+  1. Copy `SpikDoum.app` into `/Applications`.
+  2. Remove the macOS Gatekeeper quarantine flag once:
+     ```zsh
+     xattr -dr com.apple.quarantine /Applications/SpikDoum.app
+     ```
+  3. Grant **Microphone**, **Speech Recognition**, and **Screen & System Audio Recording** permissions on first launch.
+  4. Download desired Whisper / GGUF models inside **Models & Servers** (`모델 · 서버 관리`).
+- **Public distribution without Gatekeeper prompts**: Sign with an Apple Developer Program `Developer ID Application` certificate (`SPIKDOUM_SIGN_IDENTITY="Developer ID Application: ..."`), enable Hardened Runtime, and notarize with `xcrun notarytool`.
+
+---
+
+## Keyboard Shortcuts (In-App)
+
+| Shortcut | Action |
+| :--- | :--- |
+| `⌘N` | New conversation (optional auto-start listening) |
+| `⌘Return` | Request Coach advice immediately |
+| `⌘.` | Stop listening |
+| `Space` | Toggle Freeze View (`읽기 고정`) ↔ Jump to Live |
+| `⌘R` | Open Time-Synced Replay |
+| `⌘E` | Export conversation to Markdown (`.md`) |
+
+---
+
+## Privacy & Local Storage
+
+- Conversations, summaries, keywords, and optional `.m4a` recordings are stored locally in `~/Library/Application Support/SpikDoum/`.
+- Downloaded and custom-imported models are stored in `~/Library/Application Support/SpikDoum/ManagedModels/`.
+- API keys (OpenAI, Deepgram, Azure, Local Server) are stored in the macOS Keychain (`dev.spikdoum.api`).
+- Managed local `whisper-server` (`127.0.0.1:18880`) and `llama-server` (`127.0.0.1:18881`) bind strictly to loopback with a per-launch random bearer token and parent-process lifetime guard.
+- Always inform participants before recording or transcribing a conversation.
+
+---
+
+## Testing
+
+```zsh
 swift test
 ```
 
-번역 묶음·원문 연결·중복 조언 억제·키워드/요약 파싱·로컬/클라우드/자체 모델 파이프라인·검색/내보내기·아카이브/완전 삭제를 단위 테스트로 검증합니다. 실제 마이크·시스템 오디오 권한과 장시간 전사는 대상 Mac에서 확인하세요.
-
-## 원문과 번역 화면
-
-메인 화면은 실시간 STT 원문 / 한국어 번역 / 답변·조언의 세 영역입니다. 번역은 자동 조언 설정과 무관하게 동작하며, 450ms 동안 새 전사 변화가 없으면 시작합니다. 연속 발화 중에는 2초 주기 확인도 사용합니다. 최대 800자씩 순차 번역하고 결과를 스트리밍 표시하며, 번역한 원문과 결과를 세션에 함께 저장합니다. 음성 인식이 이전 발언을 수정하면 이전 번역을 비우고 다시 번역합니다. 번역·조언의 병렬 생성은 기기 성능에 따라 느려질 수 있습니다.
-
-## 입력 디바이스 선택
-
-메인 화면의 `입력 디바이스`에서 시스템 기본 입력이나 연결된 마이크를 선택합니다. 입력 채널이 있는 Core Audio 장치만 표시하며, USB 마이크·헤드셋·가상 입력 장치도 포함될 수 있습니다. 선택은 다음 실행에도 유지됩니다. 장치 목록은 3초마다 갱신하고 새로고침 버튼으로도 갱신할 수 있습니다. 녹음 중에는 선택을 잠그므로 듣기를 중지한 뒤 변경하세요. 선택한 장치가 분리되면 녹음을 중지하고 안내합니다. 시스템의 기본 마이크 설정은 변경하지 않습니다.
-
-## 화자 분리와 누적 정리
-
-로컬 CAMPPlus 임베딩 모델로 2초 음성 창을 분석하고 화자 유사도를 비교합니다. 원문에는 화자별 색상과 추정 라벨을 표시하며, 분석 결과가 도착하기 전에는 `화자 확인 중`으로 표시합니다. 한 번의 듣기 세션 안에서 익명 화자 번호를 유지하며, 듣기를 다시 시작하면 새 화자 번호를 사용합니다. 발화가 짧거나 여러 사람이 겹쳐 말하면 잘못 분류될 수 있습니다. 최대 6개 음성 클러스터를 사용하고, 충분한 음성 에너지가 없는 구간은 미분류로 남깁니다. 오디오를 별도 파일로 저장하지 않고 로컬 분석 프로세스에 전달합니다.
-
-하단 정리 패널에서 전체 요약과 화자별 요약을 전환할 수 있습니다. 대화 중 12초 간격으로 갱신을 확인하며, 각 주기에 전체 요약과 변경된 화자 한 명의 요약을 생성합니다. 실제 갱신에는 모델 생성 시간이 추가로 걸립니다. 입력이 멈추면 3초 뒤에도 요약을 시도합니다. 전체 요약은 이전 누적 요약에 새 발언을 더하고, 제목과 대화 목록 미리보기를 함께 갱신합니다. 긴 미처리 발언은 주기당 1,800자씩 순서대로 반영하므로 요약이 뒤처질 수 있습니다. 요약은 압축된 기록이며 전체 원문은 STT 기록에 따로 유지합니다. 화자별 요약은 추정 화자 분류에 영향을 받습니다.
-
-번역은 각 결과의 원문 시작·끝 위치를 저장합니다. 부분 STT 수정 시 앞부분의 유효한 결과는 유지하고 수정된 뒷부분만 교체합니다. 생성 도중 원문이 달라진 결과는 저장하지 않습니다. 이전 버전의 범위 정보 없는 번역은 첫 갱신 때 다시 생성합니다.
-
-화자 분석 워커는 `scripts/build-speaker-worker.sh`로 Python 런타임과 함께 묶습니다. 개발 빌드는 인터넷과 Python 3.9 이상이 필요하고, 완성된 앱은 별도 Python 설치가 필요 없습니다. 현재 배포 산출물은 Apple Silicon용입니다. 공개 샘플을 이용한 워커 통합 검증은 `worker/test_worker.py`를 사용합니다.
-
-## 0.2 번역 엔진 수정
-
-번역 생성에 Foundation Models를 사용하지 않고 전용 Apple Translation 엔진을 사용합니다. macOS 26.4 이상에서는 저지연 전략을 선택하고 언어별 세션을 재사용합니다. 번역은 토큰 스트리밍 대신 원문 구간별 완료 즉시 표시합니다. Apple Intelligence 활성화 여부와 무관하게 번역할 수 있지만 번역 언어 모델이 필요합니다. 누락된 언어 모델은 시스템 다운로드 안내 또는 `번역 언어 준비` 버튼으로 준비합니다. 첫 번역은 모델 준비 때문에 지연될 수 있습니다. 이전 생성형 번역 기록은 첫 갱신 시 다시 번역하며 원본 대화는 유지합니다.
-
-## 0.3 엔진 옵션과 안정성
-
-`엔진 설정`에서 STT(Apple/Deepgram), 번역(Apple/Azure), 답변·요약(Apple/OpenAI/OpenAI 호환 서버)을 독립적으로 선택합니다. API 키는 키체인에 저장합니다. 클라우드와 내부망 연결은 실제 서버 주소·키·모델 설정 후 앱의 연결 테스트로 검증하세요. Ollama는 `http://localhost:11434/v1`, LM Studio는 `http://localhost:1234/v1`, vLLM은 `http://localhost:8000/v1` 기본 주소 프리셋을 제공합니다. 내부망 IP 주소도 입력할 수 있습니다. 서버는 Chat Completions SSE 스트리밍을 지원해야 합니다. HTTP는 신뢰하는 내부망에서 사용하고 외부 연결에는 HTTPS를 사용하세요.
-
-Deepgram은 Nova-3 다국어 스트리밍, 임시/확정 결과 분리, v1 화자 구분을 사용합니다. 확정된 문장만 번역 대상으로 삼고 늦게 도착한 임시 결과와 중복 확정 패킷을 무시합니다. 마이크 음성은 PCM16으로 직접 전송하며 로컬 Python 분석 과정은 클라우드 STT 경로에서 실행하지 않습니다. 전송 버퍼가 가득 차면 누락을 숨기지 않고 듣기를 중지합니다. Azure는 2026-06-06 전용 번역 API로 문장별 언어를 자동 감지합니다. 클라우드 요청의 성능·정확도는 API 키 설정 후 실제 대화로 측정해야 합니다.
-
-STT 기본 화면은 원문을 직접 표시합니다. 화자별 보기는 별도 토글로 선택합니다. Apple 인식 세션 갱신 때 마이크 엔진을 재시작하지 않고 인식 요청만 교체합니다. 입력 버퍼가 4초 넘게 오지 않거나 음성이 있는데 12초 넘게 인식 응답이 없으면 최대 3회 복구를 시도합니다. 무음일 때는 음성 대기 상태를 표시합니다.
-
-Apple 번역은 저지연 모델 설치 여부를 확인하고, 없다면 이미 설치된 기본 번역 모델을 사용합니다. 두 종류 모두 없을 때만 언어 다운로드를 요청합니다. 번역 대기·진행·오류 상태를 표시하며, 원문이 수정돼 확정할 수 없는 완료 번역은 원문과 함께 임시 결과로 표시합니다. 번역 구간은 최대 240자로 줄이고 문장 경계로 나눕니다.
-
-전체 요약 갱신 전후 내용을 `요약 이력`에 시각·제목과 함께 보관합니다. 이전 버전에서 이미 덮어쓴 요약은 복원하지 못합니다.
-
-마이크와 Apple 음성 인식 권한은 OS 상태가 미결정일 때만 요청합니다. 허용된 권한은 다음 실행에서 재사용합니다. 개발용 임시 서명으로 앱을 재빌드하면 macOS가 새 코드로 판단해 다시 권한을 요구할 수 있습니다. 일관된 배포 서명을 사용하려면 `SPIKDOUM_SIGN_IDENTITY`를 지정해 빌드하세요. 현재 환경에는 유효한 개발자 서명 인증서가 없어 임시 서명을 사용합니다. 입력 장치 선택과 엔진 설정은 앱 설정에 저장합니다.
-
-## 0.3.3 대화 코치 중복 방지
-
-자동 조언의 변경 감지는 잘린 3,000자 창이 아니라 전체 원문을 기준으로 수행합니다. 공백·구두점·대소문자 변화와 작은 STT 수정만으로 다시 생성하지 않으며 자동 요청 간격은 최소 8초입니다. 최근 조언 5개를 모델에 전달하고 새 도움이 없으면 응답을 생략하도록 지시합니다. 완료된 자동 조언은 최근 결과와 정규화·문자 3-gram 유사도를 검사한 뒤 표시합니다. 자동 조언은 중복 검사 전 스트리밍하지 않으며, 수동 요청은 스트리밍을 유지합니다. 표현이 크게 다른 의미상 중복까지 완벽하게 판별하는 것은 아닙니다. 재실행 시 마지막 조언이 처리한 원문을 복원하여 과거 대화만으로 자동 조언을 다시 만들지 않습니다.
-
-## 0.3.4 최근 대화 표시
-
-상단에서 최근 1분/2분을 선택하고 최신 내용 따라가기를 켜거나 끕니다. 실시간 원문은 수신 시각을 기록한 짧은 발화 묶음으로 표시하고 최신 발언을 큰 글씨와 파란 카드로 강조합니다. 번역은 대응 원문 시각을 우선 사용하고 조언은 생성 시각을 기준으로 범위를 적용합니다. 번역은 아래로, 코치는 최신 결과가 있는 위로 자동 이동합니다. 전체 기록 토글로 과거 내용을 볼 수 있습니다. 듣기가 중지된 대화는 마지막 활동 시각을 기준으로 최근 구간을 보여줍니다. 이전 버전의 시각 정보 없는 원문은 별도 표시하며 시간을 추정해 붙이지 않습니다.
-
-## 0.3.5 대화 삭제와 아카이브
-
-`설정 → 대화 삭제 → 삭제 버튼 동작`에서 아카이빙(기본값) 또는 완전 삭제를 선택합니다. 대화 상단의 보관/삭제 버튼 또는 목록의 우클릭 메뉴로 실행합니다. 아카이브 탭은 보관한 대화를 읽기 전용으로 보여주며 `복원`으로 활성 목록에 돌려놓을 수 있습니다. 완전 삭제는 항상 확인창을 거칩니다. 선택한 대화의 원문·번역·조언·발언 시각·요약 및 요약 이력을 로컬 저장 파일과 앱 관리 재시작 백업(`conversations.before-restart.*.json`)에서 제거합니다. OS/Time Machine 백업, 사용자가 내보낸 사본, 외부 서비스 보관 데이터의 삭제나 물리 디스크 보안 소거를 뜻하지 않습니다. 삭제 실패 시 오류를 표시하며 복원 가능한 보관 목록으로 옮겨 놓고 완전 삭제로 보고하지 않습니다.
-
-## 0.3.7 STT 보기 사용자 설정
-
-STT 패널 전체에 배경을 적용했습니다. 패널의 `표시 설정` 버튼이나 `설정 → STT 보기 스타일`에서 기본 글자 크기(14~40pt), 기본 글자색, 패널 배경색, 최신 발언 글자색과 배경색을 조정합니다. 최신 발언은 기본 크기보다 3pt 크게 표시합니다. 미리보기와 기본 스타일 복원을 제공하며 선택은 다음 실행에도 유지됩니다. 패널의 표시 설정은 듣기가 진행 중이어도 열 수 있습니다.
-
-## 0.3.8 출력 디바이스
-
-메인 화면의 `출력 디바이스`에서 Mac의 기본 출력 장치(스피커·헤드폰 등)를 선택합니다. 출력 채널이 있고 기본 출력으로 사용할 수 있는 장치만 표시합니다. 전환 후 최대 3초 동안 실제 적용 여부를 확인하며, 목록과 현재 선택은 3초 간격 및 새로고침 버튼으로 갱신합니다. 앱 실행 시 현재 시스템 출력을 읽기만 하며 임의로 변경하지 않습니다. 변경은 사용자가 장치를 선택했을 때만 수행합니다. 이는 SpikDoum 전용 재생 장치 설정이 아니라 macOS 기본 출력 변경으로 다른 앱에도 영향을 줄 수 있습니다. 시스템 알림용 별도 출력은 변경하지 않습니다. 현재 앱에는 TTS/음성 재생 기능이 없습니다.
-
-## 0.4.0 AirPods / 이어폰 통화 모드
-
-1. Mac에 AirPods를 연결합니다.
-2. 입력 디바이스에서 AirPods 마이크(또는 내장 마이크), 출력 디바이스에서 AirPods를 선택합니다.
-3. `이어폰 통화 모드 · 마이크와 Mac 상대방 소리 함께 듣기`를 켜고 듣기를 시작합니다.
-4. 최초 사용 시 시스템 설정의 `개인정보 보호 및 보안 → 화면 및 시스템 오디오 기록` 권한을 허용합니다. OS가 요구하면 앱을 다시 실행하세요.
-
-ScreenCaptureKit으로 출력 장치에 도달하기 전 Mac 재생음을 수집하므로 이어폰을 착용해도 상대방 음성을 마이크가 공기로 다시 받아들일 필요가 없습니다. 마이크와 재생음 STT를 변경 구간별로 합치며 `[마이크]`, `[Mac 재생음]`은 실제 사람 식별이 아닌 입력 경로 표기입니다. 이 모드의 Mac 재생음은 선택한 상대방 언어의 Apple 음성 인식을 사용합니다. 주 마이크 STT는 설정된 Apple/Deepgram 엔진을 사용합니다. Mac의 다른 앱 소리도 수집될 수 있습니다. 호환성을 위한 최소 화면 출력은 즉시 버리며 영상 녹화 파일은 만들지 않습니다. 원본 오디오는 저장하지 않습니다.
-
-Apple 마이크 인식은 입력 버퍼 중단 복구를 유지하고, 클라우드 마이크 인식은 오디오 엔진 형식 변경 알림 시 최대 3회 자동 재연결을 시도합니다. 선택한 마이크가 완전히 연결 해제되면 듣기를 중지하고 장치 선택 오류를 표시합니다. Bluetooth 통화 모드 전환은 오디오 품질·샘플레이트를 바꾸며 재연결 중 짧은 누락이 발생할 수 있습니다. 실제 AirPods 통화 및 시스템 오디오 권한의 실기 검증은 별도로 필요합니다.
-
-## 0.4.1 Google Meet / Zoom 및 앱 아이콘
-
-`통화 대상`에서 Zoom 앱 또는 Google Meet를 실행한 브라우저(Chrome/Safari/Edge/Firefox)를 선택하세요. 특정 대상을 선택하면 마이크와 상대방 재생음을 함께 받는 통화 모드가 켜집니다. 회의 앱과 SpikDoum의 마이크·스피커를 동일하게 선택한 뒤 회의에 참여하고 SpikDoum에서 듣기를 시작합니다. 최초 시스템 오디오 권한이 필요합니다. Zoom 브라우저 버전은 해당 브라우저를 선택합니다. 브라우저 필터는 Meet 탭 하나만 식별하지 않으며 다른 탭 소리도 포함될 수 있습니다. 선택한 앱을 찾지 못하면 명확한 안내를 표시하고 임의로 전체 오디오를 수집하지 않습니다. 호환성이 필요하면 `전체 Mac 소리 · 호환 모드`를 직접 선택할 수 있습니다. 실제 Meet/Zoom 통화에 대한 실기 검증은 별도 필요합니다.
-
-아이콘 원본: `Resources/AppIcon-source.png`, 배포용 PNG: `Resources/AppIcon.png`, macOS 아이콘: `Resources/AppIcon.icns`. 빌드가 ICNS를 앱 리소스에 복사합니다. 내장 image_gen으로 제작했으며 제작 프롬프트는 `Resources/AppIcon-prompt.txt`에 보관합니다.
-
-## 0.4.2 유튜브 / Mac 소리 전용 STT
-
-`유튜브·Mac 소리 듣기` 버튼은 마이크를 열지 않고 전체 Mac 재생음만 인식합니다. 마이크 드라이버 초기화 오류가 유튜브 인식을 가로막는 문제를 분리했습니다. 인식 언어를 영상에 맞게 선택하세요. Mac 소리 입력 레벨과 인식 글자 수로 수집 상태를 진단합니다. 시스템 오디오 권한이 거부돼 있으면 실제 인식을 시작할 수 없으며 시스템 설정에서 직접 허용해야 합니다. 진단용 명령줄 인자 `--listen-youtube`는 실행 시 이 모드를 시작합니다. 일반 실행은 자동으로 녹음을 시작하지 않습니다.
-
-## 0.4.3 추천 설정과 집중 모드
-
-상단 추천 설정에서 유튜브(Mac 소리 전용·수동 조언), Google Meet(선택 브라우저+마이크·자동 조언), Zoom(Zoom 앱+마이크·자동 조언), 대면 대화(마이크만·자동 조언)를 적용합니다. Google Meet 메뉴에는 기타 브라우저용 전체 Mac 소리 호환 모드도 있습니다. 프리셋은 녹음을 자동 시작하거나 언어·입출력 디바이스·LLM/API 키·번역 엔진을 바꾸지 않습니다. 인식 언어와 장치를 확인한 뒤 듣기 시작을 누릅니다. 듣기 중에는 추천 설정 변경을 잠급니다.
-
-세부 설정과 요약은 펼침/접기가 가능하며 상태를 기억합니다. `패널 보기`에서 대화 목록을 접거나 펼칩니다. `집중 모드`는 대화 목록·세부 설정·요약을 함께 숨겨 STT·번역·조언 영역에 공간을 돌려주고, `화면 복원`은 집중 모드 직전 배치로 돌아갑니다. 시스템 오디오 권한이 부족하면 접힌 상태에서도 안내와 시스템 설정 링크를 보여줍니다.
-
-## 0.4.4 대화 키워드 모드
-
-대화 코치의 `키워드만`을 선택하면 답변·조언 대신 주제·인물·제품·일정 등 원문 키워드를 최대 10개 카드로 보여줍니다. 최근 1~2분 발언을 사용하며, 시각 정보 없는 기존 기록은 마지막 3,000자를 기준으로 합니다. 원문에 없는 표현과 대소문자만 다른 중복을 제거합니다. 새 대화가 들어오면 최소 6초 간격으로 갱신하고, 수동 `키워드 추출` 버튼도 제공합니다. 자동 조언 설정을 꺼 둔 유튜브 프리셋에서도 키워드 모드의 자동 갱신은 동작합니다. 키워드는 대화별로 저장하고 기존 조언 기록은 유지합니다. Apple·OpenAI·OpenAI 호환 로컬/내부망 LLM 중 현재 선택한 엔진을 사용합니다.
-
-## 0.4.5 원문·번역·조언 연결 보기
-
-기본 `연결 보기`는 STT 발언 구간을 행으로 삼아 원문, 한국어 번역, 맥락별 조언을 나란히 배치합니다. 여러 구간에 걸친 번역은 마지막 구간에 한 번 표시하며 다른 구간에서는 연결 번호로 이동합니다. 조언도 참고한 맥락의 마지막 구간에 한 번 표시하고 `맥락 #시작–#끝`으로 범위를 명시합니다. 같은 번호가 조언의 문장별 인과관계를 뜻하지는 않습니다. 확정 전 번역·조언은 별도 처리 중 영역에 표시합니다.
-
-번호를 누르면 최신 따라가기를 잠시 끄고 관련 구간을 선택합니다. `3패널 보기`에서도 같은 번호로 대응 블록을 강조하고 이동합니다. 최신 따라가기를 켜면 연결 보기의 선택을 해제하고 실시간 아래쪽으로 복귀합니다. 전체 기록과 최근 1~2분, STT 표시 설정, 키워드 모드를 사용할 수 있습니다. 원문 범위와 저장된 발췌문이 정확히 일치해야 연결하며 STT 수정으로 달라진 원문이나 연결 정보가 없는 이전 기록을 임의로 연결하지 않습니다. 기존 기록은 3패널 보기에서 확인할 수 있습니다.
-
-## 0.4.6 대화 목록 일괄 관리
-
-대화 목록의 `여러 개 선택`에서 항목별 선택 또는 `전체 선택`을 사용합니다. `선택 대화 아카이브`와 `선택 대화 완전 삭제…`를 명시적으로 선택할 수 있습니다. 아카이브 탭에서는 여러 대화의 복원과 완전 삭제를 지원합니다. 전체 선택은 현재 탭에 보이는 대화에만 적용하며 탭을 바꾸면 선택을 초기화합니다. 완전 삭제는 대상 개수와 제목을 확인한 뒤 실행하고, 라이브 저장 파일과 앱 관리 재시작 백업에서 대상들을 한 번에 제거합니다. 처리 대상에 현재 대화가 포함되면 녹음과 진행 중 작업을 중지합니다. 모든 활성 대화를 옮기거나 지운 경우 새 빈 대화를 엽니다.
-
-## 0.4.7 번역 진행 복구와 패널 글자 크기
-
-번역 큐의 다음 구간이 줄바꿈으로 시작할 때 공백만 선택해 반환하면서 이후 발언 전체가 막히던 문제를 수정했습니다. 긴 무구두점 발언과 여러 줄 원문에서도 공백을 포함해 다음 실제 문장으로 진행합니다. STT가 계속 갱신되어도 예약된 번역을 뒤로 미루지 않으며, 번역 요청이 20초를 넘으면 오래된 결과를 무효화하고 세션을 새로 만들어 재시도합니다. 연속 실패는 최대 3회 시도 후 중지하고 `번역 다시 시도`로 재개합니다. 언어 모델 미설치 오류는 `번역 언어 준비`로 처리합니다.
-
-연결 보기의 키워드는 오른쪽 대화 코치 패널 내부에 표시합니다. 원문과 번역은 왼쪽에서 연결 행을 유지하며 스크롤하고, 키워드는 별도로 읽을 수 있습니다. 상단 `글자 크기`에서 STT·번역·조언·키워드·요약·대화 목록의 본문 크기를 개별 조절하거나 `전체 작게/크게`로 함께 조절합니다. 보기 모드와 작은 조언창에도 적용되며 설정을 저장합니다. 메타데이터와 조작 버튼은 고정 크기를 유지합니다.
-
-## 0.4.8 문장 묶음 번역과 원문 행 정렬
-
-실시간 자동 번역은 완료된 문장 2~3개를 한 요청으로 처리합니다. 줄바꿈과 입력 경로 표시는 문장 수에 포함하지 않습니다. 한 문장만 남았거나 문장부호가 없더라도 2초간 입력 변화가 없거나 묶음 대기 시간이 6초를 넘으면 잔여 원문을 처리합니다. 수동 번역과 듣기 중지 시에도 잔여 내용을 번역합니다. 이전 번역은 유지하고 새 원문부터 적용합니다.
-
-연결 보기에서는 번역 요청의 정확한 원문 범위를 하나의 STT 문장 블록으로 보여주고, 같은 번호와 같은 행에 번역을 배치합니다. 번역이 여러 STT 수신 구간에 걸쳐도 결과를 다른 행에 나누거나 반복하지 않습니다. 미번역 원문은 다음 블록으로 남고, 조언은 해당 맥락의 마지막 위치에 한 번 배치합니다. 키워드 모드는 오른쪽 코치 패널을 유지합니다. 처음 업데이트한 실행에서 연결 보기를 선택하며 이후 보기 선택은 그대로 저장합니다.
-
-## 0.4.9 Mac 재생음 전용 모드의 잘못된 자동 중지 수정
-
-유튜브 등 `Mac 소리만` 모드에서 저장된 마이크(예: 연결이 끊긴 AirPods)가 없어도 듣기가 유지됩니다. 이전에는 3초 간격의 장치 점검이 사용하지 않는 마이크의 연결 해제를 오류로 판단해 시스템 오디오 인식을 중지했습니다. 마이크를 사용하는 모드에서만 연결 상태를 필수 조건으로 검사하고, Mac 소리 전용 모드에서는 마이크 조회 오류와 연결 해제를 중지 조건으로 사용하지 않습니다. 저장된 입력 장치와 Mac 기본 출력은 변경하지 않습니다.
-
-## 0.4.10 번역 옆 키워드와 읽기 고정
-
-키워드를 번역 패널 상단의 작은 카드로 옮겨 번역과 함께 표시하며, 답변·조언은 항상 오른쪽 패널에서 볼 수 있습니다. 키워드 표시와 자동 조언은 독립적으로 켜고 끕니다. 원문과 번역은 같은 문장 묶음 번호·행 높이를 사용하며 번호를 누르면 정확히 해당 묶음만 강조합니다.
-
-상단에는 제목·작은 조작 버튼·읽기 고정만 유지하고 추천 설정, 입력/출력 장치, 언어, 목표, 회의 대상은 `듣기 설정`과 앱 설정으로 옮겼습니다. 요약은 접힌 상태로 시작하고 보기 메뉴에서 다시 펼칠 수 있습니다. 설정/표시 버튼은 툴팁을 제공하며 기존 글자 크기와 집중 모드를 유지합니다.
-
-본문을 손으로 스크롤하거나 `읽기 고정`을 누르면 원문·번역·조언·키워드와 최근 시간 범위를 값 복사로 고정해 새 발언이나 STT 수정으로 읽던 블록이 바뀌지 않습니다. 음성 수신·번역·조언 생성·저장은 계속되고 새 내용이 있으면 알립니다. `최신으로 이동`을 누르면 최신 데이터로 교체하고 자동 따라가기를 재개합니다. 다른 대화를 선택하면 읽기 고정을 해제합니다. 프로그램의 자동 스크롤은 읽기 고정을 유발하지 않습니다.
-
-## 0.4.11 스페이스 읽기 전환
-
-대화 창에서 스페이스를 누르면 `읽기 고정 ↔ 최신 보기`를 전환합니다. 스페이스를 길게 눌러도 한 번만 전환하고 기본 페이지 스크롤은 발생하지 않습니다. 텍스트 입력·IME 조합 중이거나 설정/삭제 확인 창이 열린 경우에는 키를 가로채지 않습니다. Command·Control·Option·Shift·Fn과 조합한 스페이스 및 다른 앱의 스페이스 동작을 유지합니다. 음성 수신과 번역·저장은 그대로 계속됩니다.
-
-## 0.4.12 로컬 LLM 번역 API
-
-앱 설정의 번역 엔진에서 `로컬 LLM · 번역 API`를 선택하고 전체 API 주소를 입력합니다. 기본 주소는 `http://10.0.1.5:8848/v1/translate`이며 주소 뒤에 다른 경로를 덧붙이지 않고 POST합니다. API 키는 선택 사항이며 별도 키체인 항목에 저장합니다. `로컬 번역 테스트`로 샘플 문장과 응답 시간, 오류를 확인할 수 있습니다. 조언·요약 LLM과 별도로 선택하며 기존 엔진 설정을 보존해 불러옵니다.
-
-서버 스키마가 확인되지 않아 기본 요청은 수정 가능한 예시 `{ "text": "{{text}}", "source_lang": "{{source}}", "target_lang": "{{target}}" }`입니다. 고급 설정에서 서버에 맞게 요청 JSON과 번역 응답 경로를 지정하세요. 원문은 JSON 값을 통해 치환해 따옴표·개행·한글을 보존합니다. 응답 경로를 비우면 `translation`, `translated_text`, `data.translation`, `translations.0.text` 등 일반 필드를 감지하며, 명시적인 경로에는 점과 배열 인덱스를 사용할 수 있습니다. 기본 서버 응답 대기는 30초이고 5~120초로 변경할 수 있습니다. 로컬 번역에도 2~3문장 묶음·원문 행 연결·읽기 고정을 적용합니다.
-
-개발 시 해당 주소는 TCP 연결 이후 GET/POST에 HTTP 응답을 보내지 않아 실제 서버의 성공 응답과 스키마는 검증하지 못했습니다. HTTP 요청/응답 처리는 격리된 URLProtocol 테스트로 검증했습니다.
-
-## 0.5.0 앱 내 자체 모델 서버
-
-상단 `모델 · 서버 관리` 또는 앱 설정의 `자체 모델 · 서버`에서 Whisper Tiny/Base/Small 다국어 STT 모델과 Qwen2.5 1.5B Instruct Q4 번역 모델을 다운로드하고 적용합니다. 용량·SHA-256을 검증한 후에만 설치 완료로 처리합니다. 취소와 삭제를 지원하며 모델은 Application Support/SpikDoum/ManagedModels에 보관합니다. 모델 가중치는 DMG에 넣지 않아 필요한 모델만 받을 수 있습니다.
-
-앱에는 arm64 Metal 지원 whisper-server와 llama-server가 포함됩니다. 모델 적용 후 서버를 시작하고 엔진을 `자체 모델`로 바꿉니다. 이후 사용 시 서버가 중지돼 있으면 자동으로 준비합니다. 기존 Apple/Deepgram/Azure/외부 로컬 API 선택도 유지합니다. 다운로드 이후 자체 STT·번역 추론은 외부 서버로 전송하지 않습니다. 조언·요약은 별도로 선택한 LLM 엔진을 계속 사용합니다.
-
-서버 모니터에서 실행 상태·PID·CPU·메모리·처리 횟수·최근 처리 시간·로그와 시작/중지/재시작을 제공합니다. 현재 듣기에 사용 중인 서버의 중지/모델 변경/재시작은 듣기를 멈춘 후 가능합니다. 모니터는 듣기 중에도 상단 버튼으로 열 수 있습니다. 앱 종료 시 앱이 소유한 서버만 중지하며, 다른 프로세스가 포트를 쓰는 경우 종료하거나 연결을 가로채지 않습니다. STT는 127.0.0.1:18880, 번역은 127.0.0.1:18881에 바인딩하며 매 실행마다 바꾸는 인증 토큰을 사용합니다.
-
-자체 STT는 마이크와 Mac 재생음 모두 처리하며 약 3초씩 나누어 전송합니다. 인식이 입력을 따라잡지 못하면 작은 모델을 선택하도록 오류를 표시합니다. 듣기 중지 시 남은 음성을 처리하고 마지막 번역을 수행합니다. 자체 STT에서는 입력 경로만 구분하며 화자 분리는 지원하지 않습니다. 마이크와 Mac 재생음 권한은 기존과 같이 필요하지만 자체 STT는 Apple 음성 인식 권한을 사용하지 않습니다. 작은 번역 모델의 결과는 중요한 대화에서 원문과 함께 확인해야 합니다.
-
-네이티브 런타임 재빌드: `./scripts/build-managed-runtimes.sh`. 고정된 소스 커밋·라이선스·Whisper 인증 패치는 Resources/ManagedRuntimeNotice.md와 빌드 스크립트에 기록합니다. 전체 실제 모델 다운로드/인식/번역/재시작 통합 시험은 `SPIKDOUM_MANAGED_E2E=1 swift test --filter managedRuntimeDownloadsTranscribesTranslatesAndRestarts`로 실행합니다.
+Runs **88 unit tests** covering STT policies, translation batching/re-translation, Whisper noise cleanup, CJK token budgeting, bilingual coach parsing, panel layout persistence, conversation storage/replay/export, and verified model catalog integrity.
+
+Optional full end-to-end managed model test (downloads & runs real Whisper + Qwen inference):
+
+```zsh
+SPIKDOUM_MANAGED_E2E=1 swift test --filter managedRuntimeDownloadsTranscribesTranslatesAndRestarts
+```
+
+---
+
+## Project Structure
+
+```text
+.
+├── Package.swift                 # SwiftPM manifest (macOS 26, SpikDoum + SpikDoumTests)
+├── Sources/SpikDoum/             # SwiftUI app, audio capture, STT, translation, coaching, replay
+├── Tests/SpikDoumTests/          # 88 Swift Testing unit tests
+├── Resources/                    # Info.plist, AppIcon.icns/.png, ManagedRuntimeNotice.md
+├── worker/                       # Python sherpa-onnx speaker diarization worker
+└── scripts/                      # Build, signing, runtime, worker, and DMG scripts
+```
