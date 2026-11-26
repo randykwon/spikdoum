@@ -11,7 +11,7 @@ struct ManagedSTTClient {
         number(sampleRate); number(sampleRate * 2); number(UInt16(2)); number(UInt16(16)); string("data"); number(UInt32(pcm.count)); result.append(pcm)
         return result
     }
-    func request(wave: Data, language: String) -> URLRequest {
+    func request(wave: Data, language: String, prompt: String = "") -> URLRequest {
         let boundary = "SpikDoum-" + UUID().uuidString
         var request = URLRequest(url: ManagedRole.stt.baseURL.appendingPathComponent("inference"))
         request.httpMethod = "POST"; request.timeoutInterval = 45
@@ -20,15 +20,25 @@ struct ManagedSTTClient {
         var body = Data()
         func append(_ text: String) { body.append(Data(text.utf8)) }
         let sttLang = LanguageCatalog.whisperLanguageParameter(for: language)
-        for (name, value) in [("response_format", "json"), ("language", sttLang), ("temperature", "0"), ("no_speech_thold", "0.6")] {
+        var fields: [(String, String)] = [
+            ("response_format", "json"),
+            ("language", sttLang),
+            ("temperature", "0"),
+            ("no_speech_thold", "0.65")
+        ]
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPrompt.isEmpty {
+            fields.append(("prompt", String(trimmedPrompt.suffix(120))))
+        }
+        for (name, value) in fields {
             append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
         }
         append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n")
         body.append(wave); append("\r\n--\(boundary)--\r\n"); request.httpBody = body
         return request
     }
-    func transcribe(wave: Data, language: String) async throws -> String {
-        let (data, response) = try await session.data(for: request(wave: wave, language: language))
+    func transcribe(wave: Data, language: String, prompt: String = "") async throws -> String {
+        let (data, response) = try await session.data(for: request(wave: wave, language: language, prompt: prompt))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw CloudFailure(message: "자체 STT 서버 응답 오류 (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)). 모델 관리에서 상태를 확인해주세요.") }
         struct Result: Decodable { var text: String }
         return try JSONDecoder().decode(Result.self, from: data).text.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -3,6 +3,33 @@ import FoundationModels
 import Translation
 import CoreGraphics
 
+enum AudioInputMode: String, CaseIterable {
+    case micAndSystem
+    case systemOnly
+    case micOnly
+
+    var shortLabel: String {
+        switch self {
+        case .micAndSystem: return "내 목소리 + Mac"
+        case .systemOnly: return "Mac 소리만"
+        case .micOnly: return "내 마이크만"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .micAndSystem: return "waveform.and.mic"
+        case .systemOnly: return "speaker.wave.2.fill"
+        case .micOnly: return "mic.fill"
+        }
+    }
+}
+
+enum MicLanguageMode: String, CaseIterable {
+    case autoOrTarget
+    case sameAsSTT
+}
+
 @MainActor
 final class AudioLevelMonitor: ObservableObject {
     @Published var level: Double = 0
@@ -14,6 +41,26 @@ final class AppModel: ObservableObject {
     let managedMic = ManagedSpeechCapture()
     let managedSystem = ManagedSpeechCapture()
     @Published var finishingCapture = false
+    @Published var simpleFastMode = UserDefaults.standard.bool(forKey: "simpleFastMode") {
+        didSet {
+            UserDefaults.standard.set(simpleFastMode, forKey: "simpleFastMode")
+            guard oldValue != simpleFastMode else { return }
+            if simpleFastMode {
+                debounce?.cancel(); debounce = nil
+                summaryDebounce?.cancel(); summaryDebounce = nil
+                responseToken = UUID()
+                keywordToken = UUID()
+                summaryToken = UUID()
+                scriptToken = UUID()
+                liveResponse = ""
+                if !(current?.transcript.isEmpty ?? true) {
+                    scheduleTranslation(immediate: true)
+                }
+            } else if !(current?.transcript.isEmpty ?? true) {
+                scheduleResponse()
+            }
+        }
+    }
     @Published var deletionMode = DeletionMode(rawValue: UserDefaults.standard.string(forKey: "conversationDeletionMode") ?? "") ?? .archive {
         didSet { UserDefaults.standard.set(deletionMode.rawValue, forKey: "conversationDeletionMode") }
     }
@@ -66,6 +113,52 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(includeSystemAudio, forKey: "includeSystemAudio")
             if oldValue != includeSystemAudio && listening { scheduleLiveCaptureRestart() }
+        }
+    }
+    @Published var micLanguageMode = MicLanguageMode(rawValue: UserDefaults.standard.string(forKey: "micLanguageMode") ?? "") ?? .autoOrTarget {
+        didSet {
+            UserDefaults.standard.set(micLanguageMode.rawValue, forKey: "micLanguageMode")
+            guard oldValue != micLanguageMode else { return }
+            if listening && !systemAudioOnly {
+                if settings.stt == .managed {
+                    managedMic.updateLanguage(effectiveMicWhisperLanguage)
+                } else {
+                    scheduleLiveCaptureRestart(notice: "내 마이크 인식 언어를 전환합니다.")
+                }
+            }
+        }
+    }
+    var audioInputMode: AudioInputMode {
+        if systemAudioOnly { return .systemOnly }
+        return includeSystemAudio ? .micAndSystem : .micOnly
+    }
+    var effectiveMicWhisperLanguage: String {
+        switch micLanguageMode {
+        case .autoOrTarget: return LanguageCatalog.autoCode
+        case .sameAsSTT: return language
+        }
+    }
+    var effectiveMicAppleLocale: String {
+        switch micLanguageMode {
+        case .autoOrTarget: return targetLanguage
+        case .sameAsSTT: return language == LanguageCatalog.autoCode ? "en-US" : language
+        }
+    }
+    func setAudioInputMode(_ mode: AudioInputMode) {
+        guard audioInputMode != mode else { return }
+        switch mode {
+        case .micAndSystem:
+            systemAudioOnly = false
+            includeSystemAudio = true
+            presetNotice = "내 마이크와 Mac 재생음을 함께 인식·번역합니다. (헤드셋 권장)"
+        case .systemOnly:
+            systemAudioOnly = true
+            includeSystemAudio = true
+            presetNotice = "Mac 재생음만 인식합니다."
+        case .micOnly:
+            systemAudioOnly = false
+            includeSystemAudio = false
+            presetNotice = "내 마이크 목소리만 인식합니다."
         }
     }
     let systemAudio = SystemAudioCapture()
@@ -126,6 +219,9 @@ final class AppModel: ObservableObject {
     @Published var bilingualCoach = (UserDefaults.standard.object(forKey: "bilingualCoach") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(bilingualCoach, forKey: "bilingualCoach") }
     }
+    @Published var summaryLanguages = SummaryLanguagePreferences.load() {
+        didSet { summaryLanguages.save() }
+    }
     @Published var inputDevices: [AudioInputDevice] = []
     @Published var selectedInputUID = UserDefaults.standard.string(forKey: "inputDeviceUID") ?? "" {
         didSet {
@@ -150,6 +246,94 @@ final class AppModel: ObservableObject {
             self.stop()
             await self.start()
         }
+    }
+
+    var activeSTTModelLabel: String {
+        switch settings.stt {
+        case .apple: return "Apple STT"
+        case .deepgram: return "Deepgram"
+        case .managed: return managedModels.selected(.stt)?.name ?? "Whisper"
+        }
+    }
+
+    var activeTranslationModelLabel: String {
+        switch settings.translation {
+        case .apple: return "Apple 번역"
+        case .azure: return "Azure 번역"
+        case .local: return "로컬 번역"
+        case .managed: return managedModels.selected(.translation)?.name ?? "자체 번역"
+        }
+    }
+
+    func switchSTTEngine(_ engine: STTEngine, managedModelID: String? = nil) async {
+        let previousEngine = settings.stt
+        let previousModelID = managedModels.selectedSTT
+        if engine == .managed {
+            let targetModel: ManagedModel?
+            if let managedModelID {
+                targetModel = managedModels.models(for: .stt).first { $0.id == managedModelID && managedModels.installed.contains($0.id) }
+            } else if let current = managedModels.selected(.stt), managedModels.installed.contains(current.id) {
+                targetModel = current
+            } else {
+                targetModel = managedModels.models(for: .stt).first { managedModels.installed.contains($0.id) }
+            }
+            guard let chosen = targetModel else {
+                message = "설치된 자체 STT 모델이 없습니다. 메뉴에서 모델을 다운로드해주세요."
+                return
+            }
+            if previousModelID != chosen.id {
+                await managedModels.select(chosen)
+            }
+            if previousEngine != .managed {
+                settings.stt = .managed
+                presetNotice = "STT 모델(\(chosen.name))로 전환했습니다."
+            } else if previousModelID != chosen.id {
+                objectWillChange.send()
+                if listening {
+                    scheduleLiveCaptureRestart(notice: "STT 모델(\(chosen.name))로 자동 전환합니다.")
+                } else {
+                    presetNotice = "STT 모델(\(chosen.name))로 전환했습니다."
+                }
+            }
+            return
+        }
+        guard previousEngine != engine else { return }
+        settings.stt = engine
+        presetNotice = "STT 엔진을 \(activeSTTModelLabel)(으)로 전환했습니다."
+    }
+
+    func switchTranslationEngine(_ engine: TranslationEngine, managedModelID: String? = nil) async {
+        let previousEngine = settings.translation
+        let previousModelID = managedModels.selectedTranslation
+        if engine == .managed {
+            let targetModel: ManagedModel?
+            if let managedModelID {
+                targetModel = managedModels.models(for: .translation).first { $0.id == managedModelID && managedModels.installed.contains($0.id) }
+            } else if let current = managedModels.selected(.translation), managedModels.installed.contains(current.id) {
+                targetModel = current
+            } else {
+                targetModel = managedModels.models(for: .translation).first { managedModels.installed.contains($0.id) }
+            }
+            guard let chosen = targetModel else {
+                message = "설치된 자체 번역 모델이 없습니다. 메뉴에서 모델을 다운로드해주세요."
+                return
+            }
+            if previousModelID != chosen.id {
+                await managedModels.select(chosen)
+            }
+            if previousEngine != .managed {
+                settings.translation = .managed
+                presetNotice = "번역 모델(\(chosen.name))로 전환했습니다."
+            } else if previousModelID != chosen.id {
+                objectWillChange.send()
+                reloadTranslationEngineAfterSettingsChange()
+                presetNotice = "번역 모델(\(chosen.name))로 전환했습니다."
+            }
+            return
+        }
+        guard previousEngine != engine else { return }
+        settings.translation = engine
+        presetNotice = "번역 엔진을 \(activeTranslationModelLabel)(으)로 전환했습니다."
     }
 
     func reloadTranslationEngineAfterSettingsChange() {
@@ -300,6 +484,25 @@ final class AppModel: ObservableObject {
             return targetLanguageName
         }
         return "\(sttLanguageBadge) + \(targetLanguageName)"
+    }
+    func resolvedSummaryLanguages(for transcript: String? = nil) -> [SupportedLanguage] {
+        let context = transcript ?? current?.transcript ?? ""
+        let sttSpec = effectiveCoachSourceLanguage(for: context)
+        return summaryLanguages.resolvedLanguages(sttSpec: sttSpec, targetSpec: targetLanguageSpec)
+    }
+    var summaryLanguageBadge: String {
+        let langs = resolvedSummaryLanguages()
+        if langs.count <= 2 {
+            return langs.map { $0.displayName(in: uiLanguage) }.joined(separator: " + ")
+        }
+        let first = langs.first?.displayName(in: uiLanguage) ?? targetLanguageName
+        return "\(first) 외 \(langs.count - 1)개"
+    }
+    func updateSummaryLanguages(_ mutate: (inout SummaryLanguagePreferences) -> Void) {
+        mutate(&summaryLanguages)
+        if !(current?.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+            Task { [weak self] in await self?.refreshSummaries() }
+        }
     }
     @Published var liveResponse = ""
     @Published var translationConfiguration: TranslationSession.Configuration?
@@ -547,12 +750,14 @@ final class AppModel: ObservableObject {
         if conversations[index].title == "새 대화", text.count > 5 { conversations[index].title = String(text.prefix(24)) }
         scheduleSave()
         scheduleTranslation()
-        scheduleResponse()
-        summaryDebounce?.cancel()
-        summaryDebounce = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-            await self?.refreshSummaries()
+        if !simpleFastMode {
+            scheduleResponse()
+            summaryDebounce?.cancel()
+            summaryDebounce = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { return }
+                await self?.refreshSummaries()
+            }
         }
     }
 

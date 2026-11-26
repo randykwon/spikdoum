@@ -2,11 +2,21 @@ import Foundation
 import Translation
 
 extension AppModel {
-    func scheduleTranslation() {
-        // Coalesce STT updates without continually postponing translation during speech.
+    var translationSilenceFlushSeconds: TimeInterval { simpleFastMode ? 1.5 : 2.0 }
+    var translationMaxWaitSeconds: TimeInterval { simpleFastMode ? 4.5 : 6.0 }
+
+    func scheduleTranslation(immediate: Bool = false) {
+        if immediate {
+            translationDebounce?.cancel()
+            translationDebounce = nil
+            translateLatest(automatic: true)
+            return
+        }
+        // Coalesce rapid STT updates briefly without postponing translation during continuous speech.
         guard translationDebounce == nil else { return }
+        let delayMS = simpleFastMode ? 80 : 150
         translationDebounce = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(450))
+            try? await Task.sleep(for: .milliseconds(delayMS))
             guard !Task.isCancelled, let self else { return }
             self.translationDebounce = nil
             self.translateLatest(automatic: true)
@@ -20,8 +30,21 @@ extension AppModel {
             translationRetryCount = 0
         }
         guard !translating, let item = current, item.archivedAt == nil else { return }
-        let flush = !automatic || !listening || TranslationPolicy.shouldFlush(now: Date(), lastChange: lastTranscriptChange, batchStarted: translationBatchStartedAt)
-        let work = TranslationPolicy.plan(transcript: stableCloudTranscript ?? item.transcript, entries: item.translations ?? [], flush: flush, targetLanguage: targetLanguage)
+        let flush = !automatic || !listening || TranslationPolicy.shouldFlush(
+            now: Date(),
+            lastChange: lastTranscriptChange,
+            batchStarted: translationBatchStartedAt,
+            silenceSeconds: translationSilenceFlushSeconds,
+            maxWaitSeconds: translationMaxWaitSeconds
+        )
+        let work = TranslationPolicy.plan(
+            transcript: stableCloudTranscript ?? item.transcript,
+            entries: item.translations ?? [],
+            flush: flush,
+            targetLanguage: targetLanguage,
+            minSentences: 1,
+            maxSentences: 1
+        )
         if let index = conversations.firstIndex(where: { $0.id == item.id }),
            conversations[index].translations?.count != work.retained.count {
             conversations[index].translations = work.retained
@@ -29,7 +52,7 @@ extension AppModel {
         }
         if work.waitingForSentences {
             if translationBatchStartedAt == nil { translationBatchStartedAt = Date() }
-            translationStatus = "2~3문장 모으는 중 · 현재 \(work.completedSentences)문장"
+            translationStatus = simpleFastMode ? "심플 패스트 · 한 문장 모으는 중" : "한 문장 모으는 중…"
             scheduleTranslation()
             return
         }
@@ -43,7 +66,7 @@ extension AppModel {
         translationToken = token
         translating = true
         translationSource = source
-        translationStatus = "새 원문 \(targetLanguageName) 번역 중"
+        translationStatus = simpleFastMode ? "심플 패스트 · \(targetLanguageName) 번역 중" : "새 문장 \(targetLanguageName) 번역 중"
         liveTranslation = ""
         translationError = nil
         translationTask = Task { [weak self] in
@@ -52,29 +75,81 @@ extension AppModel {
                 if self.translationToken == token {
                     self.translationWatchdog?.cancel()
                     self.translating = false
-                    if self.translationError == nil { self.scheduleTranslation() }
+                    if self.translationError == nil {
+                        let hasMorePending: Bool = {
+                            guard let current = self.current, current.archivedAt == nil else { return false }
+                            let nextFlush = !self.listening || TranslationPolicy.shouldFlush(
+                                now: Date(),
+                                lastChange: self.lastTranscriptChange,
+                                batchStarted: self.translationBatchStartedAt,
+                                silenceSeconds: self.translationSilenceFlushSeconds,
+                                maxWaitSeconds: self.translationMaxWaitSeconds
+                            )
+                            let next = TranslationPolicy.plan(
+                                transcript: self.stableCloudTranscript ?? current.transcript,
+                                entries: current.translations ?? [],
+                                flush: nextFlush,
+                                targetLanguage: self.targetLanguage,
+                                minSentences: 1,
+                                maxSentences: 1
+                            )
+                            return !next.waitingForSentences && !next.source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        }()
+                        self.scheduleTranslation(immediate: hasMorePending)
+                    }
                 }
             }
             do {
                 let started = Date()
                 let targetSpec = self.targetLanguageSpec
+                let isMicTurn = TranslationPolicy.sourceTag(of: source) == "마이크"
                 let translated: String
                 if cleanedSource.isEmpty {
                     translated = "…"
                 } else {
-                    let detectedSpec = self.language == LanguageCatalog.autoCode ? (LanguageCatalog.detectLanguage(for: cleanedSource) ?? self.detectedSTTLanguage) : self.sourceLanguageSpec
+                    let detectedSpec: SupportedLanguage?
+                    if isMicTurn {
+                        detectedSpec = LanguageCatalog.detectLanguage(for: cleanedSource) ?? (self.micLanguageMode == .autoOrTarget ? targetSpec : self.sourceLanguageSpec)
+                    } else if self.language == LanguageCatalog.autoCode {
+                        detectedSpec = LanguageCatalog.detectLanguage(for: cleanedSource) ?? self.detectedSTTLanguage
+                    } else {
+                        detectedSpec = self.sourceLanguageSpec
+                    }
+                    // Two-way mic translation: if the user speaks in their own target language (e.g. Korean)
+                    // while listening to a foreign-language meeting (e.g. Japanese/English), translate the user's
+                    // microphone turn into the partner's STT language so both directions appear side by side.
+                    let partnerSpec = self.sourceLanguageSpec ?? self.detectedSTTLanguage
+                    let effectiveTarget: SupportedLanguage
+                    if isMicTurn,
+                       let detectedSpec,
+                       detectedSpec.translationCode == targetSpec.translationCode,
+                       let partnerSpec,
+                       partnerSpec.translationCode != targetSpec.translationCode {
+                        effectiveTarget = partnerSpec
+                    } else {
+                        effectiveTarget = targetSpec
+                    }
                     let sourceShort = detectedSpec?.shortCode ?? LanguageCatalog.whisperLanguageParameter(for: self.language)
                     if self.settings.translation == .managed {
-                        translated = try await self.managedModels.translate(cleanedSource, source: sourceShort, target: targetSpec.shortCode, targetName: targetSpec.englishName)
+                        translated = try await self.managedModels.translate(
+                            cleanedSource,
+                            source: sourceShort,
+                            target: effectiveTarget.shortCode,
+                            targetName: effectiveTarget.englishName,
+                            onDelta: { [weak self] partial in
+                                guard let self, self.translationToken == token else { return }
+                                self.liveTranslation = partial
+                            }
+                        )
                     } else if self.settings.translation == .local {
-                        translated = try await LocalTranslator(settings: self.settings.localTranslation, key: SecretStore.read("translation-local")).translate(cleanedSource, source: sourceShort, target: targetSpec.shortCode)
+                        translated = try await LocalTranslator(settings: self.settings.localTranslation, key: SecretStore.read("translation-local")).translate(cleanedSource, source: sourceShort, target: effectiveTarget.shortCode)
                     } else if self.settings.translation == .azure {
-                        translated = try await AzureTranslator(key: SecretStore.read("azure"), region: self.settings.azureRegion).translate(cleanedSource, target: targetSpec.azureCode)
-                    } else if let detectedSpec, detectedSpec.translationCode == targetSpec.translationCode {
+                        translated = try await AzureTranslator(key: SecretStore.read("azure"), region: self.settings.azureRegion).translate(cleanedSource, target: effectiveTarget.azureCode)
+                    } else if let detectedSpec, detectedSpec.translationCode == effectiveTarget.translationCode {
                         translated = cleanedSource
                     } else {
                         let sourceCode = detectedSpec?.translationCode ?? "en"
-                        let targetCode = targetSpec.translationCode
+                        let targetCode = effectiveTarget.translationCode
                         translated = try await self.translateWithApple(cleanedSource, sourceCode: sourceCode, targetCode: targetCode)
                         guard self.translationToken == token, !Task.isCancelled else { return }
                     }
@@ -150,6 +225,27 @@ extension AppModel {
             self.translateLatest(automatic: true)
         }
     }
+    func translateTextWithConfiguredEngine(_ text: String, sourceHint: SupportedLanguage? = nil, into targetSpec: SupportedLanguage) async throws -> String {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return "" }
+        let detected = sourceHint ?? LanguageCatalog.detectLanguage(for: cleaned)
+        if let detected, detected.translationCode == targetSpec.translationCode {
+            return cleaned
+        }
+        let sourceShort = detected?.shortCode ?? "auto"
+        switch settings.translation {
+        case .managed:
+            return try await managedModels.translate(cleaned, source: sourceShort, target: targetSpec.shortCode, targetName: targetSpec.englishName)
+        case .local:
+            return try await LocalTranslator(settings: settings.localTranslation, key: SecretStore.read("translation-local")).translate(cleaned, source: sourceShort, target: targetSpec.shortCode)
+        case .azure:
+            return try await AzureTranslator(key: SecretStore.read("azure"), region: settings.azureRegion).translate(cleaned, target: targetSpec.azureCode)
+        case .apple:
+            let sourceCode = detected?.translationCode ?? "en"
+            return try await translateWithApple(cleaned, sourceCode: sourceCode, targetCode: targetSpec.translationCode)
+        }
+    }
+
     private func translateWithApple(_ text: String, sourceCode: String, targetCode: String) async throws -> String {
         let sourceLang = Locale.Language(identifier: sourceCode)
         let targetLang = Locale.Language(identifier: targetCode)
@@ -188,6 +284,16 @@ extension AppModel {
                 nativeTranslationSessions[cacheKey] = session
             }
             return try await session.translate(text).targetText
+        }
+    }
+    func warmUpTranslationEngine() {
+        guard settings.translation == .apple else { return }
+        let sourceCode = sourceLanguageSpec?.translationCode ?? detectedSTTLanguage?.translationCode ?? "en"
+        let targetCode = targetLanguageSpec.translationCode
+        guard sourceCode != targetCode else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.translateWithApple("OK", sourceCode: sourceCode, targetCode: targetCode)
         }
     }
     func prepareTranslationLanguages() {

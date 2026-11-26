@@ -132,6 +132,29 @@ enum LanguageCatalog {
         }
         return code.flatMap { language(for: $0) }
     }
+
+    /// Verifies that generated text (e.g., a summary) is actually written in the expected language.
+    /// Small on-device LLMs sometimes drift into English when given English source text despite target-language instructions.
+    static func matchesExpectedLanguage(_ text: String, expected: SupportedLanguage) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 8 else { return true }
+        switch expected.shortCode {
+        case "ko":
+            let hangulCount = trimmed.unicodeScalars.filter { (0xAC00...0xD7A3).contains($0.value) }.count
+            return hangulCount >= 3
+        case "ja":
+            let kanaCount = trimmed.unicodeScalars.filter { (0x3040...0x30FF).contains($0.value) }.count
+            if kanaCount >= 2 { return true }
+            return detectLanguage(for: trimmed)?.shortCode == "ja"
+        case "zh":
+            let cjkCount = trimmed.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }.count
+            let hangulOrKana = trimmed.unicodeScalars.filter { (0xAC00...0xD7A3).contains($0.value) || (0x3040...0x30FF).contains($0.value) }.count
+            return cjkCount >= 3 && hangulOrKana == 0
+        default:
+            guard let detected = detectLanguage(for: trimmed) else { return true }
+            return detected.shortCode == expected.shortCode
+        }
+    }
 }
 
 enum L10n {

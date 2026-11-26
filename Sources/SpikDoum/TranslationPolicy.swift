@@ -29,7 +29,7 @@ enum TranslationPolicy {
         return (retained, cursor, stringIndex)
     }
     /// Reconcile only the invalid suffix after a partial STT revision.
-    static func plan(transcript: String, entries: [TranslationEntry], flush: Bool = true, targetLanguage: String? = nil) -> TranslationWork {
+    static func plan(transcript: String, entries: [TranslationEntry], flush: Bool = true, targetLanguage: String? = nil, minSentences: Int = 2, maxSentences: Int = 3) -> TranslationWork {
         let kept = retained(transcript: transcript, entries: entries, targetLanguage: targetLanguage)
         let cursor = kept.cursor
         let retained = kept.entries
@@ -40,6 +40,8 @@ enum TranslationPolicy {
         var endings: [String.Index] = []
         let closing = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'”’」』)]}"))
         let punctuation = CharacterSet(charactersIn: ".!?。！？")
+        let required = max(1, minSentences)
+        let sentenceCap = max(required, maxSentences)
         tokenizer.enumerateTokens(in: pending.startIndex..<pending.endIndex) { range, _ in
             let sentence = String(pending[range]).trimmingCharacters(in: closing)
             // Newlines and audio-source labels are not sentence endings.
@@ -48,12 +50,21 @@ enum TranslationPolicy {
                 let abbreviations = ["mr.", "mrs.", "ms.", "dr.", "prof.", "e.g.", "i.e."]
                 if !abbreviations.contains(sentence.lowercased()) { endings.append(range.upperBound) }
             }
-            return endings.count < 3
+            return endings.count < sentenceCap
         }
-        let waiting = hasSpeech && endings.count < 2 && !flush
+        // In live 1-sentence mode, keep [마이크] and [Mac 재생음] turns separated cleanly at source boundaries.
+        let sourceBoundary: String.Index? = required == 1 ? firstSourceBoundary(in: pending) : nil
+        let waiting = hasSpeech && endings.count < required && sourceBoundary == nil && !flush
         let source: String
         if waiting || !hasSpeech { source = "" }
-        else if endings.count >= 2 { source = String(pending[..<endings[min(3, endings.count) - 1]]) }
+        else if let boundary = sourceBoundary {
+            if let firstEnding = endings.first, firstEnding <= boundary {
+                source = String(pending[..<firstEnding])
+            } else {
+                source = String(pending[..<boundary])
+            }
+        }
+        else if endings.count >= required { source = String(pending[..<endings[min(sentenceCap, endings.count) - 1]]) }
         else {
             // Flush residual/unfinished speech on silence or at the maximum wait time.
             let leadingWhitespace = pending.prefix { $0.isWhitespace }.count
@@ -64,8 +75,50 @@ enum TranslationPolicy {
                                end: end, waitingForSentences: waiting, completedSentences: endings.count,
                                prefix: String(transcript.prefix(end)))
     }
-    static func shouldFlush(now: Date, lastChange: Date, batchStarted: Date?) -> Bool {
-        now.timeIntervalSince(lastChange) >= 2 || batchStarted.map { now.timeIntervalSince($0) >= 6 } == true
+
+    /// Finds the first newline transition into a `[마이크]` or `[Mac 재생음]` tag after non-empty leading speech.
+    static func firstSourceBoundary(in pending: String) -> String.Index? {
+        let markers = ["\n[마이크]", "\n[Mac 재생음]"]
+        var earliest: String.Index?
+        for marker in markers {
+            var searchStart = pending.startIndex
+            while let range = pending.range(of: marker, range: searchStart..<pending.endIndex) {
+                let prefix = pending[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prefix.isEmpty {
+                    let boundary = pending.index(after: range.lowerBound)
+                    if earliest == nil || boundary < earliest! {
+                        earliest = boundary
+                    }
+                    break
+                }
+                searchStart = range.upperBound
+            }
+        }
+        return earliest
+    }
+
+    static func sourceTag(of text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[마이크]") { return "마이크" }
+        if trimmed.hasPrefix("[Mac 재생음]") { return "Mac 재생음" }
+        return nil
+    }
+
+    static func displayText(strippingSourceTag text: String) -> String {
+        let lines = text.components(separatedBy: .newlines).map { line -> String in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[마이크]") {
+                return String(trimmed.dropFirst("[마이크]".count)).trimmingCharacters(in: .whitespaces)
+            }
+            if trimmed.hasPrefix("[Mac 재생음]") {
+                return String(trimmed.dropFirst("[Mac 재생음]".count)).trimmingCharacters(in: .whitespaces)
+            }
+            return line
+        }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    static func shouldFlush(now: Date, lastChange: Date, batchStarted: Date?, silenceSeconds: TimeInterval = 2, maxWaitSeconds: TimeInterval = 6) -> Bool {
+        now.timeIntervalSince(lastChange) >= silenceSeconds || batchStarted.map { now.timeIntervalSince($0) >= maxWaitSeconds } == true
     }
     static func isCurrent(_ work: TranslationWork, transcript: String) -> Bool {
         transcript.hasPrefix(work.prefix)

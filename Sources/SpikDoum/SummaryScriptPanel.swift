@@ -306,23 +306,35 @@ struct SummaryScriptPanel: View {
     }
 
     var body: some View {
-        VSplitView {
-            if model.panelLayout.summaryScriptReversed {
-                fullScriptSection
-                    .padding(.bottom, 10)
-                    .frame(minHeight: 220, maxHeight: .infinity)
+        let showSummary = model.panelLayout.isVisible(.summary)
+        let showScript = model.panelLayout.isVisible(.script)
+        Group {
+            if showSummary && showScript {
+                VSplitView {
+                    if model.panelLayout.summaryScriptReversed {
+                        fullScriptSection
+                            .padding(.bottom, 10)
+                            .frame(minHeight: 220, maxHeight: .infinity)
 
-                SummaryPanel(model: model)
-                    .padding(.top, 10)
-                    .frame(minHeight: 160, idealHeight: 230)
-            } else {
-                SummaryPanel(model: model)
-                    .padding(.bottom, 10)
-                    .frame(minHeight: 160, idealHeight: 230)
+                        SummaryPanel(model: model)
+                            .padding(.top, 10)
+                            .frame(minHeight: 160, idealHeight: 230)
+                    } else {
+                        SummaryPanel(model: model)
+                            .padding(.bottom, 10)
+                            .frame(minHeight: 160, idealHeight: 230)
 
+                        fullScriptSection
+                            .padding(.top, 10)
+                            .frame(minHeight: 220, maxHeight: .infinity)
+                    }
+                }
+            } else if showSummary {
+                SummaryPanel(model: model)
+                    .frame(maxHeight: .infinity)
+            } else if showScript {
                 fullScriptSection
-                    .padding(.top, 10)
-                    .frame(minHeight: 220, maxHeight: .infinity)
+                    .frame(maxHeight: .infinity)
             }
         }
     }
@@ -346,6 +358,7 @@ struct SummaryScriptPanel: View {
                     Text("\(paragraphs.count)").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                PanelFontButton(title: "전체 스크립트", value: $model.panelTypography.summary, defaultValue: 16)
                 if model.organizingScript {
                     ProgressView().controlSize(.small)
                 }
@@ -372,6 +385,16 @@ struct SummaryScriptPanel: View {
                 }
                 .controlSize(.small)
                 .disabled(paragraphs.isEmpty && organized == nil)
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { model.panelLayout.setVisible(.script, false) }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("전체 스크립트 패널 숨기기")
             }
 
             Picker("스크립트 표시", selection: scriptMode) {

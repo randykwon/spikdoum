@@ -50,3 +50,50 @@ struct PanelFontControls: View {
         }
     }
 }
+
+struct PanelFontButton: View {
+    let title: String
+    @Binding var value: Double
+    var range: ClosedRange<Double> = 12...40
+    var defaultValue: Double = 16
+    @State private var showing = false
+
+    var body: some View {
+        Button { showing.toggle() } label: {
+            Image(systemName: "textformat.size")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help("\(title) 글자 크기 (\(Int(value))pt)")
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("\(title) 글자 크기").font(.headline)
+                    Spacer()
+                    Button("기본값") { value = defaultValue }.controlSize(.small)
+                }
+                HStack(spacing: 8) {
+                    Button("A−") {
+                        value = max(range.lowerBound, value - 1)
+                    }
+                    .controlSize(.small)
+                    .disabled(value <= range.lowerBound)
+                    Slider(value: $value, in: range, step: 1)
+                        .frame(width: 150)
+                        .accessibilityLabel(title + " 글자 크기")
+                    Button("A+") {
+                        value = min(range.upperBound, value + 1)
+                    }
+                    .controlSize(.small)
+                    .disabled(value >= range.upperBound)
+                    Text("\(Int(value))pt")
+                        .font(.caption.bold())
+                        .monospacedDigit()
+                        .frame(width: 36, alignment: .trailing)
+                }
+            }
+            .padding(14)
+        }
+    }
+}

@@ -95,13 +95,33 @@ private func fixtureModel(data: Data, hash: String? = nil) -> ManagedModel {
     #expect(String(data: wave.prefix(4), encoding: .utf8) == "RIFF")
     #expect(String(data: wave.subdata(in: 36..<40), encoding: .utf8) == "data")
     #expect(wave.suffix(4) == pcm)
-    let request = ManagedSTTClient(key: "test-token").request(wave: wave, language: "en-US")
+    let request = ManagedSTTClient(key: "test-token").request(wave: wave, language: "en-US", prompt: "Previous sentence.")
     #expect(request.url?.host == "127.0.0.1")
     #expect(request.url?.path == "/inference")
     #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
     let body = request.httpBody!
     #expect(body.range(of: wave) != nil)
-    #expect(String(decoding: body, as: UTF8.self).contains("name=\"language\"\r\n\r\nen"))
+    let bodyText = String(decoding: body, as: UTF8.self)
+    #expect(bodyText.contains("name=\"language\"\r\n\r\nen"))
+    #expect(bodyText.contains("name=\"prompt\"\r\n\r\nPrevious sentence."))
+    #expect(ManagedModelManager.visibleStreamingTranslation("<think>drafting") == "")
+    #expect(ManagedModelManager.visibleStreamingTranslation("<think>drafting</think>안녕하세요") == "안녕하세요")
+}
+@Test func managedSTTPolicyBlocksRepetitionLoopsAndHallucinationsButPreservesRealSpeech() {
+    #expect(ManagedSTTPolicy.sanitize("ん ん ん ん ん ん ん ん") == nil)
+    #expect(ManagedSTTPolicy.sanitize("И? И? И? И? И? И?") == nil)
+    #expect(ManagedSTTPolicy.sanitize("И?") == nil)
+    #expect(ManagedSTTPolicy.sanitize("んんんんんんんん") == nil)
+    #expect(ManagedSTTPolicy.sanitize("ご視聴ありがとうございました。") == nil)
+    #expect(ManagedSTTPolicy.sanitize("Thank you for watching!") == nil)
+    #expect(ManagedSTTPolicy.sanitize("はい、わかりました", previousChunk: "はい、わかりました") == nil)
+
+    #expect(ManagedSTTPolicy.sanitize("明日の会議のスケジュールを確認しましょう。") == "明日の会議のスケジュールを確認しましょう。")
+    #expect(ManagedSTTPolicy.sanitize("오늘 회의 안건을 정리하겠습니다.") == "오늘 회의 안건을 정리하겠습니다.")
+    #expect(ManagedSTTPolicy.sanitize("Let's review the project budget together.") == "Let's review the project budget together.")
+
+    #expect(ManagedSTTPolicy.safePrompt(from: "ん ん ん").isEmpty)
+    #expect(ManagedSTTPolicy.safePrompt(from: "明日の会議のスケジュールを確認しましょう。") == "明日の会議のスケジュールを確認しましょう。")
 }
 @Test func managedPortProbeDoesNotAdoptOrTerminateAnExistingServer() throws {
     let fd = socket(AF_INET, SOCK_STREAM, 0)

@@ -28,6 +28,16 @@ enum WorkspacePanelKind: String, CaseIterable, Codable, Identifiable, Equatable,
     }
 }
 
+enum HideablePanel: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
+    case stt
+    case translation
+    case coach
+    case summary
+    case script
+
+    var id: String { rawValue }
+}
+
 struct PanelLayout: Codable, Equatable, Sendable {
     static let storageKey = "panelLayoutOrderV1"
     static let defaultOrder: [WorkspacePanelKind] = [.stt, .translation, .coach, .summaryScript]
@@ -35,11 +45,32 @@ struct PanelLayout: Codable, Equatable, Sendable {
     var splitOrder: [WorkspacePanelKind] = defaultOrder
     var linkedSummaryOnLeft: Bool = false
     var summaryScriptReversed: Bool = false
+    var hiddenPanels: Set<HideablePanel> = []
 
-    init(splitOrder: [WorkspacePanelKind] = defaultOrder, linkedSummaryOnLeft: Bool = false, summaryScriptReversed: Bool = false) {
+    init(
+        splitOrder: [WorkspacePanelKind] = defaultOrder,
+        linkedSummaryOnLeft: Bool = false,
+        summaryScriptReversed: Bool = false,
+        hiddenPanels: Set<HideablePanel> = []
+    ) {
         self.splitOrder = Self.normalized(splitOrder)
         self.linkedSummaryOnLeft = linkedSummaryOnLeft
         self.summaryScriptReversed = summaryScriptReversed
+        self.hiddenPanels = hiddenPanels
+        ensureAtLeastOneMainPanelVisible()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case splitOrder, linkedSummaryOnLeft, summaryScriptReversed, hiddenPanels
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let order = try values.decodeIfPresent([WorkspacePanelKind].self, forKey: .splitOrder) ?? Self.defaultOrder
+        let linkedLeft = try values.decodeIfPresent(Bool.self, forKey: .linkedSummaryOnLeft) ?? false
+        let reversed = try values.decodeIfPresent(Bool.self, forKey: .summaryScriptReversed) ?? false
+        let hidden = try values.decodeIfPresent(Set<HideablePanel>.self, forKey: .hiddenPanels) ?? []
+        self.init(splitOrder: order, linkedSummaryOnLeft: linkedLeft, summaryScriptReversed: reversed, hiddenPanels: hidden)
     }
 
     static func normalized(_ order: [WorkspacePanelKind]) -> [WorkspacePanelKind] {
@@ -53,8 +84,65 @@ struct PanelLayout: Codable, Equatable, Sendable {
         return result
     }
 
+    func isVisible(_ panel: HideablePanel) -> Bool {
+        !hiddenPanels.contains(panel)
+    }
+
+    var hasHiddenPanels: Bool {
+        !hiddenPanels.isEmpty
+    }
+
+    var hasAnySummaryScriptVisible: Bool {
+        isVisible(.summary) || isVisible(.script)
+    }
+
+    /// Always keeps at least one core conversation panel (STT, Translation, or Coach) visible.
+    func canHide(_ panel: HideablePanel, includeCoach: Bool = true) -> Bool {
+        guard isVisible(panel) else { return false }
+        switch panel {
+        case .summary, .script:
+            return true
+        case .stt, .translation, .coach:
+            let core: [HideablePanel] = includeCoach ? [.stt, .translation, .coach] : [.stt, .translation]
+            let visibleCore = core.filter { isVisible($0) }
+            return visibleCore.count > 1 || !visibleCore.contains(panel)
+        }
+    }
+
+    mutating func setVisible(_ panel: HideablePanel, _ visible: Bool, includeCoach: Bool = true) {
+        if visible {
+            hiddenPanels.remove(panel)
+        } else if canHide(panel, includeCoach: includeCoach) {
+            hiddenPanels.insert(panel)
+        }
+        ensureAtLeastOneMainPanelVisible()
+    }
+
+    mutating func toggle(_ panel: HideablePanel, includeCoach: Bool = true) {
+        setVisible(panel, !isVisible(panel), includeCoach: includeCoach)
+    }
+
+    mutating func showAllPanels() {
+        hiddenPanels = []
+    }
+
+    private mutating func ensureAtLeastOneMainPanelVisible() {
+        let core: [HideablePanel] = [.stt, .translation, .coach]
+        if !core.contains(where: { !hiddenPanels.contains($0) }) {
+            hiddenPanels.remove(.stt)
+        }
+    }
+
     func visibleSplitPanels(includeSummaryScript: Bool) -> [WorkspacePanelKind] {
-        Self.normalized(splitOrder).filter { includeSummaryScript || $0 != .summaryScript }
+        let filtered = Self.normalized(splitOrder).filter { panel in
+            switch panel {
+            case .stt: return isVisible(.stt)
+            case .translation: return isVisible(.translation)
+            case .coach: return isVisible(.coach)
+            case .summaryScript: return includeSummaryScript && hasAnySummaryScriptVisible
+            }
+        }
+        return filtered.isEmpty ? [.stt] : filtered
     }
 
     mutating func move(_ panel: WorkspacePanelKind, by delta: Int, includeSummaryScript: Bool) {
@@ -90,6 +178,7 @@ struct PanelLayout: Codable, Equatable, Sendable {
         splitOrder = Self.defaultOrder
         linkedSummaryOnLeft = false
         summaryScriptReversed = false
+        hiddenPanels = []
     }
 
     static func load(defaults: UserDefaults = .standard) -> Self {
@@ -97,11 +186,7 @@ struct PanelLayout: Codable, Equatable, Sendable {
               let decoded = try? JSONDecoder().decode(Self.self, from: data) else {
             return Self()
         }
-        return Self(
-            splitOrder: decoded.splitOrder,
-            linkedSummaryOnLeft: decoded.linkedSummaryOnLeft,
-            summaryScriptReversed: decoded.summaryScriptReversed
-        )
+        return decoded
     }
 
     func save(defaults: UserDefaults = .standard) {
@@ -125,6 +210,8 @@ struct PanelReorderBar: View {
     var extraActionIcon: String? = nil
     var extraActionHelp: String? = nil
     var onExtraAction: (() -> Void)? = nil
+    var hideHelp: String = "이 패널 숨기기"
+    var onHide: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 6) {
@@ -181,6 +268,16 @@ struct PanelReorderBar: View {
             .foregroundStyle(canMoveRight ? .secondary : .quaternary)
             .disabled(!canMoveRight)
             .help(moveRightHelp)
+
+            if let onHide {
+                Button(action: onHide) {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help(hideHelp)
+            }
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 3)

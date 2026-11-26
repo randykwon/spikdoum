@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import Speech
 import AudioToolbox
 
@@ -69,11 +70,16 @@ enum SpeechRecognitionPolicy {
     }
 }
 
-/// Protects the recognition request while audio callbacks and MainActor swap sessions.
+/// Protects the recognition request / macOS 26 SpeechAnalyzer stream while audio callbacks and MainActor swap sessions.
 /// Buffers a brief window (~0.5s) of audio during session rotation so words at boundaries are not dropped.
 private final class SpeechAudioSink: @unchecked Sendable {
     private let lock = NSLock()
+    private let convertQueue = DispatchQueue(label: "SpikDoum.SpeechAnalyzer.PCM", qos: .userInteractive)
     private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var analyzerContinuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var analyzerTargetFormat: AVAudioFormat?
+    private var analyzerConverter: AVAudioConverter?
+    private var analyzerSourceFormat: AVAudioFormat?
     private var accepting = false
     private var pendingBuffers: [AVAudioPCMBuffer] = []
     private var lastBuffer = Date()
@@ -82,12 +88,28 @@ private final class SpeechAudioSink: @unchecked Sendable {
     func setAccepting(_ value: Bool) {
         lock.lock()
         accepting = value
-        if !value { pendingBuffers.removeAll(); request = nil }
+        let cont = !value ? analyzerContinuation : nil
+        if !value {
+            pendingBuffers.removeAll()
+            request = nil
+            analyzerContinuation = nil
+            analyzerTargetFormat = nil
+        }
         lock.unlock()
+        cont?.finish()
+        if !value {
+            convertQueue.async { [weak self] in
+                self?.analyzerConverter = nil
+                self?.analyzerSourceFormat = nil
+            }
+        }
     }
 
     func replace(_ request: SFSpeechAudioBufferRecognitionRequest?) {
         lock.lock()
+        let oldCont = analyzerContinuation
+        analyzerContinuation = nil
+        analyzerTargetFormat = nil
         self.request = request
         let toDrain: [AVAudioPCMBuffer]
         if request != nil && !pendingBuffers.isEmpty {
@@ -97,8 +119,34 @@ private final class SpeechAudioSink: @unchecked Sendable {
             toDrain = []
         }
         lock.unlock()
+        oldCont?.finish()
         if let request {
             for buffer in toDrain { request.append(buffer) }
+        }
+    }
+
+    func replaceAnalyzer(continuation: AsyncStream<AnalyzerInput>.Continuation?, targetFormat: AVAudioFormat?) {
+        lock.lock()
+        let oldCont = analyzerContinuation
+        self.request = nil
+        self.analyzerContinuation = continuation
+        self.analyzerTargetFormat = targetFormat
+        let toDrain: [AVAudioPCMBuffer]
+        if continuation != nil && !pendingBuffers.isEmpty {
+            toDrain = pendingBuffers
+            pendingBuffers.removeAll()
+        } else {
+            toDrain = []
+        }
+        lock.unlock()
+        oldCont?.finish()
+        convertQueue.async { [weak self] in
+            self?.analyzerConverter = nil
+            self?.analyzerSourceFormat = nil
+            guard let self, let continuation else { return }
+            for buffer in toDrain {
+                self.deliverToAnalyzer(buffer, continuation: continuation, targetFormat: targetFormat)
+            }
         }
     }
 
@@ -112,14 +160,51 @@ private final class SpeechAudioSink: @unchecked Sendable {
         lastBuffer = Date()
         if peak > 0.015 { lastVoice = lastBuffer }
         let request = self.request
-        if request == nil {
+        let continuation = self.analyzerContinuation
+        let targetFormat = self.analyzerTargetFormat
+        if request == nil && continuation == nil {
             if let copy = Self.copy(buffer) {
                 pendingBuffers.append(copy)
                 if pendingBuffers.count > 25 { pendingBuffers.removeFirst() }
             }
         }
         lock.unlock()
-        request?.append(buffer)
+        if let request {
+            request.append(buffer)
+        } else if let continuation, let copy = Self.copy(buffer) {
+            convertQueue.async { [weak self] in
+                self?.deliverToAnalyzer(copy, continuation: continuation, targetFormat: targetFormat)
+            }
+        }
+    }
+
+    private func deliverToAnalyzer(
+        _ buffer: AVAudioPCMBuffer,
+        continuation: AsyncStream<AnalyzerInput>.Continuation,
+        targetFormat: AVAudioFormat?
+    ) {
+        guard let targetFormat, buffer.format != targetFormat else {
+            continuation.yield(AnalyzerInput(buffer: buffer))
+            return
+        }
+        if analyzerSourceFormat != buffer.format || analyzerConverter == nil {
+            analyzerConverter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            analyzerSourceFormat = buffer.format
+        }
+        guard let converter = analyzerConverter else { return }
+        let ratio = targetFormat.sampleRate / max(1, buffer.format.sampleRate)
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
+        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: max(1, capacity)) else { return }
+        var supplied = false
+        var error: NSError?
+        converter.convert(to: output, error: &error) { _, status in
+            if supplied { status.pointee = .noDataNow; return nil }
+            supplied = true
+            status.pointee = .haveData
+            return buffer
+        }
+        guard error == nil, output.frameLength > 0 else { return }
+        continuation.yield(AnalyzerInput(buffer: output))
     }
 
     func resetHealth() { lock.lock(); lastBuffer = Date(); lastVoice = .distantPast; lock.unlock() }
@@ -147,10 +232,14 @@ final class SpeechCapture {
     private var inputDeviceUID = ""
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognition: SFSpeechRecognitionTask?
+    private var speechAnalyzer: SpeechAnalyzer?
+    private var analyzerResultsTask: Task<Void, Never>?
+    private var usingModernAnalyzer = false
     private var rotation: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
     private var recovery: Task<Void, Never>?
     private var routeObserver: NSObjectProtocol?
+    private var audioStartedAt = Date.distantPast
     private var generation = UUID()
     private var tapped = false
     private var active = false
@@ -179,7 +268,7 @@ final class SpeechCapture {
         self.inputDeviceUID = inputDeviceUID; self.locale = locale
         self.onText = onText; self.onError = onError; self.onTurns = onTurns; self.onStatus = onSTTStatus; self.onAudioBuffer = onAudioBuffer
         committed = ""; partial = ""; segmentOrder = []; segmentTokens = [:]; intervals = [:]
-        hardRetryCount = 0; softRetryCount = 0
+        hardRetryCount = 0; softRetryCount = 0; usingModernAnalyzer = false
         active = true
         sink.setAccepting(true)
         let analyzer = SpeakerAnalyzer()
@@ -194,7 +283,13 @@ final class SpeechCapture {
         if !externalAudio {
             do { try analyzer.start(); speakerAnalyzer = analyzer } catch { onSpeakerStatus(error.localizedDescription) }
         }
-        do { try beginRecognition(); try startAudio() } catch { stop(); throw error }
+        do {
+            let startedModern = await tryBeginModernAnalyzer()
+            if !startedModern {
+                try beginRecognition()
+            }
+            try startAudio()
+        } catch { stop(); throw error }
         watchdog = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
@@ -232,14 +327,26 @@ final class SpeechCapture {
         tapped = true
         sink.resetHealth()
         if let observer = routeObserver { NotificationCenter.default.removeObserver(observer); routeObserver = nil }
-        routeObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
+        engine.prepare()
+        try engine.start()
+        let startedEngine = engine
+        audioStartedAt = Date()
+        routeObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: startedEngine, queue: nil) { [weak self] _ in
             Task { @MainActor in
-                guard let self, self.active else { return }
+                guard let self, self.active, self.engine === startedEngine else { return }
+                // USB microphones (e.g. Logitech C930c) and Bluetooth devices commonly emit an initial
+                // IOUnit configuration-change notification ~50-200ms after start while running normally.
+                try? await Task.sleep(for: .milliseconds(250))
+                guard self.active, self.engine === startedEngine else { return }
+                if Date().timeIntervalSince(self.audioStartedAt) < 1.5 && startedEngine.isRunning {
+                    return
+                }
+                if startedEngine.isRunning && Date().timeIntervalSince(self.sink.health().buffer) < 1.0 {
+                    return
+                }
                 self.recoverHard(reason: "오디오 입력 경로가 변경되어 재연결 중", rebuildAudio: true)
             }
         }
-        engine.prepare()
-        try engine.start()
     }
 
     private func ensureRecognizer() throws -> SFSpeechRecognizer {
@@ -251,6 +358,98 @@ final class SpeechCapture {
         }
         recognizer = created
         return created
+    }
+
+    /// Attempts to start macOS 26 continuous streaming SpeechAnalyzer + SpeechTranscriber when assets are installed.
+    /// If assets are supported but not yet downloaded, triggers silent background installation and falls back immediately to SFSpeechRecognizer.
+    private func tryBeginModernAnalyzer() async -> Bool {
+        guard SpeechTranscriber.isAvailable else { return false }
+        let targetLocale = Locale(identifier: locale)
+        guard let matchedLocale = await SpeechTranscriber.supportedLocale(equivalentTo: targetLocale) else { return false }
+        let transcriber = SpeechTranscriber(
+            locale: matchedLocale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange]
+        )
+        let assetStatus = await AssetInventory.status(forModules: [transcriber])
+        if assetStatus == .supported {
+            Task.detached(priority: .utility) {
+                _ = try? await AssetInventory.reserve(locale: matchedLocale)
+                if let installer = try? await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    try? await installer.downloadAndInstall()
+                }
+            }
+            return false
+        }
+        guard assetStatus == .installed else { return false }
+
+        let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        let token = UUID()
+        generation = token
+        let segmentID = token.uuidString
+        segmentOrder.append(segmentID)
+        speakerAnalyzer?.reset(segment: segmentID)
+
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        do {
+            try await analyzer.start(inputSequence: stream)
+        } catch {
+            continuation.finish()
+            return false
+        }
+        guard active, generation == token else {
+            continuation.finish()
+            await analyzer.cancelAndFinishNow()
+            return false
+        }
+
+        speechAnalyzer = analyzer
+        usingModernAnalyzer = true
+        lastResult = Date()
+        sink.replaceAnalyzer(continuation: continuation, targetFormat: targetFormat)
+        onStatus?(externalAudio ? "Mac 재생음 스트리밍 STT 준비 완료" : "실시간 스트리밍 STT 준비 완료")
+
+        analyzerResultsTask = Task { [weak self] in
+            do {
+                for try await result in transcriber.results {
+                    guard let self else { return }
+                    let raw = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let isFinal = result.isFinal
+                    let midpoint = CMTimeGetSeconds(result.range.start) + CMTimeGetSeconds(result.range.duration) / 2
+                    let safeTime = midpoint.isFinite ? midpoint : 0
+                    await MainActor.run {
+                        guard self.active, self.generation == token else { return }
+                        guard !raw.isEmpty else { return }
+                        self.lastResult = Date()
+                        self.hardRetryCount = 0
+                        self.softRetryCount = 0
+                        if isFinal {
+                            self.committed = [self.committed, raw].filter { !$0.isEmpty }.joined(separator: "\n")
+                            self.partial = ""
+                            self.onText?(self.committed)
+                            var tokens = self.segmentTokens[segmentID] ?? []
+                            tokens.append((text: raw, time: safeTime))
+                            self.segmentTokens[segmentID] = tokens
+                            self.renderTurns()
+                        } else {
+                            self.partial = raw
+                            self.onText?([self.committed, raw].filter { !$0.isEmpty }.joined(separator: "\n"))
+                        }
+                        self.onStatus?(self.externalAudio ? "Mac 재생음 스트리밍 STT 수신 중" : "실시간 스트리밍 STT 수신 중")
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.active, self.generation == token else { return }
+                    // Seamlessly fall back to SFSpeechRecognizer if SpeechAnalyzer encounters a runtime interruption.
+                    self.usingModernAnalyzer = false
+                    self.recoverSoft(reason: "스트리밍 STT 재연결 중", delay: 0.3)
+                }
+            }
+        }
+        return true
     }
 
     private func beginRecognition() throws {
@@ -332,6 +531,7 @@ final class SpeechCapture {
             try? await Task.sleep(for: .milliseconds(Int(wait * 1000)))
             guard !Task.isCancelled, let self, self.active else { return }
             self.recovery = nil
+            if self.usingModernAnalyzer, await self.tryBeginModernAnalyzer() { return }
             do { try self.beginRecognition() }
             catch { self.recoverHard(reason: error.localizedDescription, rebuildAudio: false) }
         }
@@ -390,7 +590,15 @@ final class SpeechCapture {
     }
 
     private func stopRecognition() {
-        generation = UUID(); rotation?.cancel(); rotation = nil; sink.replace(nil)
+        generation = UUID()
+        rotation?.cancel(); rotation = nil
+        analyzerResultsTask?.cancel(); analyzerResultsTask = nil
+        let analyzer = speechAnalyzer
+        speechAnalyzer = nil
+        if let analyzer {
+            Task { await analyzer.cancelAndFinishNow() }
+        }
+        sink.replace(nil)
         request?.endAudio(); recognition?.cancel(); recognition = nil; request = nil
     }
 

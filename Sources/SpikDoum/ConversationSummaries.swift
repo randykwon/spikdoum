@@ -5,6 +5,55 @@ struct SummaryState: Codable {
     var text: String
     var coveredSource: String
     var updatedAt: Date
+    var primaryLanguageCode: String? = nil
+    var localizedTexts: [String: String]? = nil
+}
+
+struct SummaryLanguagePreferences: Codable, Equatable, Sendable {
+    static let storageKey = "summaryLanguagePreferencesV1"
+
+    var includeTranslationLanguage: Bool = true
+    var includeSTTLanguage: Bool = true
+    var extraLanguageCodes: [String] = []
+
+    func resolvedLanguages(sttSpec: SupportedLanguage?, targetSpec: SupportedLanguage) -> [SupportedLanguage] {
+        var result: [SupportedLanguage] = []
+        func appendUnique(_ lang: SupportedLanguage?) {
+            guard let lang, !result.contains(where: { $0.code == lang.code }) else { return }
+            result.append(lang)
+        }
+        if includeTranslationLanguage { appendUnique(targetSpec) }
+        if includeSTTLanguage { appendUnique(sttSpec) }
+        for code in extraLanguageCodes {
+            appendUnique(LanguageCatalog.language(for: code))
+        }
+        if result.isEmpty {
+            result.append(targetSpec)
+        }
+        return result
+    }
+
+    mutating func toggleExtra(_ code: String) {
+        if let index = extraLanguageCodes.firstIndex(of: code) {
+            extraLanguageCodes.remove(at: index)
+        } else if LanguageCatalog.language(for: code) != nil {
+            extraLanguageCodes.append(code)
+        }
+    }
+
+    static func load(defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: storageKey),
+              let decoded = try? JSONDecoder().decode(Self.self, from: data) else {
+            return Self()
+        }
+        return decoded
+    }
+
+    func save(defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(self) {
+            defaults.set(data, forKey: Self.storageKey)
+        }
+    }
 }
 
 @Generable

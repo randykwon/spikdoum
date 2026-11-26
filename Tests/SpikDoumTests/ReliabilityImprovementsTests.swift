@@ -120,6 +120,45 @@ import Testing
     #expect(chunks[0].count < 16000 * 2 * 3)
 }
 
+@Test func managedAudioTrimsExcessLeadingSilenceBeforeSpeech() async throws {
+    let format = try #require(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false))
+    final class Collector: @unchecked Sendable {
+        let lock = NSLock()
+        var chunks: [Data] = []
+        func append(_ data: Data) { lock.lock(); chunks.append(data); lock.unlock() }
+        func snapshot() -> [Data] { lock.lock(); defer { lock.unlock() }; return chunks }
+    }
+    let collector = Collector()
+    let bufferer = ManagedAudioBufferer()
+    bufferer.start { collector.append($0) }
+
+    func feed(samples: Int, amplitude: Float) throws {
+        var sent = 0
+        while sent < samples {
+            let count = min(1600, samples - sent)
+            let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)))
+            buffer.frameLength = AVAudioFrameCount(count)
+            for i in 0..<count {
+                buffer.floatChannelData![0][i] = amplitude * Float(sin(Double(sent + i) * 2 * .pi * 440 / 16000))
+            }
+            bufferer.append(buffer)
+            sent += count
+        }
+    }
+
+    // 2.0s silence followed by 1.0s speech + 0.3s trailing silence should trim leading silence to pre-roll (~0.16s).
+    try feed(samples: 16000 * 2, amplitude: 0)
+    try feed(samples: 16000, amplitude: 0.25)
+    try feed(samples: 16000 * 3 / 10, amplitude: 0)
+    _ = await bufferer.finish()
+
+    let chunks = collector.snapshot()
+    #expect(chunks.count == 1)
+    // Total emitted bytes should be ~1.36s (< 2.0s), proving the 2.0s leading silence was trimmed.
+    #expect(chunks[0].count < 16000 * 2 * 2)
+    #expect(chunks[0].count >= 16000 * 2 * 9 / 10)
+}
+
 @Test func conversationSearchMatchesMetadataTranscriptTranslationAndSummary() {
     var active = Conversation(title: "Q3 로드맵", transcript: "Let us finalize the release schedule.")
     active.translations = [TranslationEntry(source: active.transcript, translated: "출시 일정을 확정합시다.", sourceStart: 0, sourceEnd: active.transcript.count)]
@@ -617,4 +656,73 @@ import Testing
     let head = AdvicePolicy.boundedHead(longJapanese, maxTokens: 200)
     #expect(AdvicePolicy.estimatedTokens(head) <= 200)
     #expect(longJapanese.hasPrefix(head))
+}
+
+@Test func summaryLanguagePreferencesSupportSTTTranslationAndMultipleExtraLanguages() throws {
+    let suite = "SpikDoum.SummaryLangTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    let en = try #require(LanguageCatalog.language(for: "en-US"))
+    let ko = try #require(LanguageCatalog.language(for: "ko-KR"))
+    let ja = try #require(LanguageCatalog.language(for: "ja-JP"))
+
+    // Default includes both translation (target) and STT languages without duplicates.
+    var prefs = SummaryLanguagePreferences()
+    #expect(prefs.resolvedLanguages(sttSpec: en, targetSpec: ko).map(\.code) == ["ko-KR", "en-US"])
+    #expect(prefs.resolvedLanguages(sttSpec: ko, targetSpec: ko).map(\.code) == ["ko-KR"])
+
+    // Adding extra languages produces multi-language list in order, deduplicated.
+    prefs.toggleExtra(ja.code)
+    prefs.toggleExtra("zh-CN")
+    prefs.toggleExtra(en.code) // already included via STT
+    #expect(prefs.resolvedLanguages(sttSpec: en, targetSpec: ko).map(\.code) == ["ko-KR", "en-US", "ja-JP", "zh-CN"])
+
+    // Persistence round-trip.
+    prefs.save(defaults: defaults)
+    #expect(SummaryLanguagePreferences.load(defaults: defaults) == prefs)
+
+    // Fallback to target language if all toggles/extras are off.
+    prefs.includeSTTLanguage = false
+    prefs.includeTranslationLanguage = false
+    prefs.extraLanguageCodes = []
+    #expect(prefs.resolvedLanguages(sttSpec: en, targetSpec: ko).map(\.code) == ["ko-KR"])
+
+    // Language-match verifier catches English drift when Korean or Japanese was requested.
+    #expect(!LanguageCatalog.matchesExpectedLanguage("Improving Mac playback and career advice for women.", expected: ko))
+    #expect(LanguageCatalog.matchesExpectedLanguage("여성을 위한 커리어 조언과 발표 전략에 대한 핵심 요약입니다.", expected: ko))
+    #expect(!LanguageCatalog.matchesExpectedLanguage("Improving Mac playback and career advice.", expected: ja))
+    #expect(LanguageCatalog.matchesExpectedLanguage("キャリアアドバイスと重要なポイントの要約です。", expected: ja))
+    #expect(LanguageCatalog.matchesExpectedLanguage("Summary of career advice and key action items.", expected: en))
+}
+
+@Test func panelVisibilityHidesPersistsAndKeepsAtLeastOneMainPanel() throws {
+    let suite = "SpikDoum.PanelVisibilityTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    var layout = PanelLayout()
+    layout.setVisible(.coach, false)
+    layout.setVisible(.summary, false)
+    #expect(!layout.isVisible(.coach))
+    #expect(!layout.isVisible(.summary))
+    #expect(layout.hasAnySummaryScriptVisible)
+
+    layout.setVisible(.script, false)
+    #expect(!layout.hasAnySummaryScriptVisible)
+    #expect(layout.visibleSplitPanels(includeSummaryScript: true) == [.stt, .translation])
+
+    layout.setVisible(.stt, false)
+    #expect(!layout.isVisible(.stt))
+    #expect(!layout.canHide(.translation))
+    layout.setVisible(.translation, false)
+    #expect(layout.isVisible(.translation))
+
+    layout.save(defaults: defaults)
+    let reloaded = PanelLayout.load(defaults: defaults)
+    #expect(reloaded.hiddenPanels == layout.hiddenPanels)
+
+    layout.showAllPanels()
+    #expect(!layout.hasHiddenPanels)
+    #expect(layout.visibleSplitPanels(includeSummaryScript: true) == PanelLayout.defaultOrder)
 }

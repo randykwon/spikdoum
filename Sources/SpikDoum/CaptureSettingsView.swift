@@ -92,6 +92,18 @@ struct CaptureOptionsView: View {
                 }
                 Toggle("통화 모드 · 마이크와 회의 상대방 소리 함께 듣기", isOn: $model.includeSystemAudio)
                     .font(.caption).disabled(model.starting)
+                if !model.systemAudioOnly {
+                    HStack(spacing: 10) {
+                        Text("내 마이크 언어").font(.caption)
+                        Picker("내 마이크 언어", selection: $model.micLanguageMode) {
+                            Text(model.settings.stt == .apple ? "내 번역 언어 (\(model.targetLanguageName))" : "자동 감지 (권장)").tag(MicLanguageMode.autoOrTarget)
+                            Text("상대 STT 언어와 동일 (\(model.sttLanguageBadge))").tag(MicLanguageMode.sameAsSTT)
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 260)
+                        .disabled(model.starting)
+                    }
+                }
                 HStack {
                     Toggle("Mac 소리만 인식 · 마이크 사용 안 함", isOn: $model.systemAudioOnly).disabled(model.starting)
                     if model.includeSystemAudio || model.systemAudioOnly {

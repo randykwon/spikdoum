@@ -63,6 +63,9 @@ struct Conversation: Codable, Identifiable {
     var allKeywords: [String] {
         KeywordPolicy.merged(current: keywords, history: keywordHistory ?? [])
     }
+    var allRelatedKeywords: [String: [String]] {
+        KeywordPolicy.mergedRelated(current: keywords, history: keywordHistory ?? [])
+    }
 }
 
 enum AdvicePolicy {
@@ -147,14 +150,14 @@ enum AdvicePolicy {
     static func context(_ text: String) -> String { String(text.suffix(3000)) }
 
     /// Conservative token estimate tailored for Apple FoundationModels (4,096-token window):
-    /// CJK / non-ASCII characters frequently tokenize to ~1.5–2.2 tokens each, whereas ASCII averages ~0.35 tokens.
+    /// CJK / non-ASCII characters frequently tokenize to ~2.0–3.0 tokens each (byte-fallback), whereas ASCII averages ~0.35 tokens.
     static func estimatedTokens(_ text: String) -> Int {
         var units = 0 // 1 token == 10 units
         for scalar in text.unicodeScalars {
             if scalar.isASCII {
                 units += 4
             } else {
-                units += 22
+                units += 26
             }
         }
         return (units + 9) / 10
@@ -169,7 +172,7 @@ enum AdvicePolicy {
             let prev = text.index(before: start)
             var charUnits = 0
             for scalar in text[prev].unicodeScalars {
-                charUnits += scalar.isASCII ? 4 : 22
+                charUnits += scalar.isASCII ? 4 : 26
             }
             if units + charUnits > maxUnits { break }
             units += charUnits
@@ -186,7 +189,7 @@ enum AdvicePolicy {
         while end < text.endIndex {
             var charUnits = 0
             for scalar in text[end].unicodeScalars {
-                charUnits += scalar.isASCII ? 4 : 22
+                charUnits += scalar.isASCII ? 4 : 26
             }
             if units + charUnits > maxUnits { break }
             units += charUnits

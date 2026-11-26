@@ -15,6 +15,7 @@ enum ConversationSearch {
             if (item.translations ?? []).contains(where: { $0.translated.range(of: trimmed, options: options) != nil }) { return true }
             if (item.summaries?.values ?? [:].values).contains(where: { $0.text.range(of: trimmed, options: options) != nil }) { return true }
             if item.allKeywords.contains(where: { $0.range(of: trimmed, options: options) != nil }) { return true }
+            if item.allRelatedKeywords.values.contains(where: { list in list.contains { $0.range(of: trimmed, options: options) != nil } }) { return true }
             return false
         }
     }
@@ -48,7 +49,20 @@ enum ConversationExport {
             lines.append("")
             lines.append("## 전체 요약")
             lines.append("")
-            lines.append(summary.text)
+            if let localized = summary.localizedTexts, localized.count > 1 {
+                let orderedCodes = ([summary.primaryLanguageCode].compactMap { $0 } + localized.keys.sorted()).reduce(into: [String]()) { acc, code in
+                    if !acc.contains(code), localized[code]?.isEmpty == false { acc.append(code) }
+                }
+                for code in orderedCodes {
+                    let langName = LanguageCatalog.language(for: code)?.nativeName ?? code
+                    lines.append("### \(langName)")
+                    lines.append("")
+                    lines.append(localized[code] ?? "")
+                    lines.append("")
+                }
+            } else {
+                lines.append(summary.text)
+            }
         }
 
         let speakerSummaries = (conversation.summaries ?? [:])
@@ -68,10 +82,17 @@ enum ConversationExport {
 
         let allKeywords = conversation.allKeywords
         if !allKeywords.isEmpty {
+            let relatedMap = conversation.allRelatedKeywords
             lines.append("")
             lines.append("## 핵심 키워드")
             lines.append("")
-            lines.append(allKeywords.map { "`\($0)`" }.joined(separator: " · "))
+            let formatted = allKeywords.map { term -> String in
+                if let rel = relatedMap[term.lowercased()], !rel.isEmpty {
+                    return "`\(term)` (\(rel.joined(separator: ", ")))"
+                }
+                return "`\(term)`"
+            }
+            lines.append(formatted.joined(separator: " · "))
         }
 
         if let organized = conversation.organizedScript,

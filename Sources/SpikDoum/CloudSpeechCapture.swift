@@ -152,9 +152,14 @@ final class CloudSpeechCapture {
                 catch { return }
             }
         }
+        let audioStartedAt = Date()
         routeObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.token == sessionToken else { return }
+                try? await Task.sleep(for: .milliseconds(250))
+                guard self.token == sessionToken else { return }
+                if engine.isRunning && Date().timeIntervalSince(audioStartedAt) < 1.5 { return }
+                if engine.isRunning { return }
                 onError("[AUDIO_ROUTE_CHANGED] Bluetooth 입력 형식이 변경되었습니다.")
             }
         }

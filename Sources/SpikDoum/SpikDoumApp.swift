@@ -26,7 +26,8 @@ struct SpikDoumApp: App {
         .commands {
             CommandMenu(model.t("menu.conversation")) {
                 Button(model.t("action.newConversation")) { model.newConversation(autoStart: true) }.keyboardShortcut("n")
-                Button(model.t("action.getAdviceNow")) { Task { await model.advise() } }.keyboardShortcut(.return, modifiers: [.command])
+                Toggle("심플 패스트 모드 (STT · 번역 전용)", isOn: $model.simpleFastMode).keyboardShortcut("f", modifiers: [.command, .shift])
+                Button(model.t("action.getAdviceNow")) { Task { await model.advise() } }.keyboardShortcut(.return, modifiers: [.command]).disabled(model.simpleFastMode)
                 Button(model.t("action.stopListening")) { model.pauseListening() }.keyboardShortcut(".")
                 Divider()
                 Button(model.t("action.replayMenu")) {
@@ -103,6 +104,7 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Label(model.listening ? model.t("panel.sttLive") : model.t("panel.stt"), systemImage: "mic.fill").font(.title3.bold()).foregroundStyle(.blue)
                     Spacer(minLength: 4)
+                    PanelFontButton(title: "STT 원문", value: $model.sttAppearance.fontSize, range: STTAppearance.minFontSize...STTAppearance.maxFontSize, defaultValue: 20)
                     Menu {
                         Button {
                             model.selectSTTLanguage(LanguageCatalog.autoCode)
@@ -154,7 +156,20 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             VStack(alignment: .leading, spacing: 16) {
-                Text("SpikDoum").font(.title2.bold())
+                HStack {
+                    Text("SpikDoum").font(.title2.bold())
+                    Spacer()
+                    PanelFontButton(title: "대화 목록", value: $model.panelTypography.sidebar, defaultValue: 14)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) { columnVisibility = .detailOnly }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("대화 목록 사이드바 숨기기")
+                }
                 Text(model.t("app.tagline")).foregroundStyle(.secondary)
                 Button(action: { showingArchive = false; model.newConversation(autoStart: true) }) { Label(model.t("action.newConversation"), systemImage: "plus") }.disabled(model.starting)
                 Toggle(model.t("action.autoListenOnNew"), isOn: $model.autoStartListeningOnNewConversation)
@@ -248,7 +263,16 @@ struct ContentView: View {
             }.padding().navigationSplitViewColumnWidth(220)
         } detail: {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
+                HStack(spacing: 10) {
+                    Button {
+                        showingArchive = false
+                        model.newConversation(autoStart: true)
+                    } label: {
+                        Label(model.t("action.newConversation"), systemImage: "plus")
+                    }
+                    .fixedSize()
+                    .help(model.t("action.newConversation") + " (⌘N)")
+                    .disabled(model.starting)
                     VStack(alignment: .leading) {
                         Text(model.current?.title ?? model.t("action.newConversation")).font(.headline).lineLimit(1)
                         Label(model.sttStatus, systemImage: model.listening ? "waveform" : "mic")
@@ -271,6 +295,25 @@ struct ContentView: View {
                                 .disabled(model.starting)
                         }
                     }
+                    if model.simpleFastMode {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) { model.simpleFastMode = false }
+                        } label: {
+                            Label("심플 모드", systemImage: "bolt.fill")
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                        .help("심플 모드 켜짐 · STT·번역 성능 집중 (클릭 또는 ⇧⌘F로 전체 모드 복귀)")
+                    } else {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) { model.simpleFastMode = true }
+                        } label: {
+                            Label("심플 모드", systemImage: "bolt")
+                        }
+                        .labelStyle(.iconOnly)
+                        .help("심플 모드 켜기 · STT·번역 성능 집중 (코치·키워드·요약·스크립트 중지, ⇧⌘F)")
+                    }
                     Button { toggleFocus() } label: {
                         Label(isFocused ? model.t("panel.restoreLayout") : model.t("panel.focus"), systemImage: isFocused ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                     }.labelStyle(.iconOnly).help(isFocused ? model.t("panel.restoreLayout") : model.t("panel.focus"))
@@ -283,21 +326,135 @@ struct ContentView: View {
                         .labelStyle(.iconOnly).help("자체 STT · 번역 모델 다운로드 및 서버 모니터")
                     Button { showingSettings = true } label: { Label(model.t("settings.title"), systemImage: "gearshape") }
                         .labelStyle(.iconOnly).help(model.t("settings.title")).disabled(model.starting)
-                    Button { showSummaryScriptPanel.toggle() } label: {
-                        Label(model.t("panel.summaryScriptToggle"), systemImage: showSummaryScriptPanel ? "sidebar.right" : "sidebar.squares.right")
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            if !showSummaryScriptPanel || !model.panelLayout.hasAnySummaryScriptVisible {
+                                showSummaryScriptPanel = true
+                                if !model.panelLayout.hasAnySummaryScriptVisible {
+                                    model.panelLayout.setVisible(.summary, true)
+                                    model.panelLayout.setVisible(.script, true)
+                                }
+                            } else {
+                                showSummaryScriptPanel = false
+                            }
+                        }
+                    } label: {
+                        Label(model.t("panel.summaryScriptToggle"), systemImage: (showSummaryScriptPanel && model.panelLayout.hasAnySummaryScriptVisible) ? "sidebar.right" : "sidebar.squares.right")
                     }.labelStyle(.iconOnly).help(model.t("panel.summaryScriptToggle"))
+                    let anyPanelHidden = columnVisibility == .detailOnly
+                        || model.panelLayout.hasHiddenPanels
+                        || !showSummaryScriptPanel
+                        || !model.showTranslationKeywords
                     Menu {
-                        Toggle(model.t("panel.summaryScriptToggle"), isOn: $showSummaryScriptPanel)
-                        Button(columnVisibility == .detailOnly ? model.t("panel.toggleSidebarShow") : model.t("panel.toggleSidebarHide")) { columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly }
+                        Section("패널 표시 / 숨기기") {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+                                }
+                            } label: {
+                                Label("대화 목록 (사이드바)", systemImage: columnVisibility == .detailOnly ? "circle" : "checkmark")
+                            }
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.panelLayout.toggle(.stt, includeCoach: !model.simpleFastMode)
+                                }
+                            } label: {
+                                Label("STT 원문", systemImage: model.panelLayout.isVisible(.stt) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.panelLayout.isVisible(.stt) && !model.panelLayout.canHide(.stt, includeCoach: !model.simpleFastMode))
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.panelLayout.toggle(.translation, includeCoach: !model.simpleFastMode)
+                                }
+                            } label: {
+                                Label("번역", systemImage: model.panelLayout.isVisible(.translation) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.panelLayout.isVisible(.translation) && !model.panelLayout.canHide(.translation, includeCoach: !model.simpleFastMode))
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.showTranslationKeywords.toggle()
+                                }
+                            } label: {
+                                Label("핵심 키워드", systemImage: (!model.simpleFastMode && model.showTranslationKeywords) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.simpleFastMode)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.panelLayout.toggle(.coach, includeCoach: true)
+                                }
+                            } label: {
+                                Label("대화 코치 (답변 · 조언)", systemImage: (!model.simpleFastMode && model.panelLayout.isVisible(.coach)) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.simpleFastMode || (model.panelLayout.isVisible(.coach) && !model.panelLayout.canHide(.coach, includeCoach: true)))
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    let currentlyVisible = showSummaryScriptPanel && model.panelLayout.isVisible(.summary)
+                                    if currentlyVisible {
+                                        model.panelLayout.setVisible(.summary, false)
+                                    } else {
+                                        showSummaryScriptPanel = true
+                                        model.panelLayout.setVisible(.summary, true)
+                                    }
+                                }
+                            } label: {
+                                Label("대화 요약", systemImage: (!model.simpleFastMode && showSummaryScriptPanel && model.panelLayout.isVisible(.summary)) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.simpleFastMode)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    let currentlyVisible = showSummaryScriptPanel && model.panelLayout.isVisible(.script)
+                                    if currentlyVisible {
+                                        model.panelLayout.setVisible(.script, false)
+                                    } else {
+                                        showSummaryScriptPanel = true
+                                        model.panelLayout.setVisible(.script, true)
+                                    }
+                                }
+                            } label: {
+                                Label("전체 스크립트", systemImage: (!model.simpleFastMode && showSummaryScriptPanel && model.panelLayout.isVisible(.script)) ? "checkmark" : "circle")
+                            }
+                            .disabled(model.simpleFastMode)
+                        }
+                        if anyPanelHidden {
+                            Divider()
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    columnVisibility = .all
+                                    showSummaryScriptPanel = true
+                                    model.showTranslationKeywords = true
+                                    model.panelLayout.showAllPanels()
+                                }
+                            } label: {
+                                Label("숨긴 패널 모두 다시 표시", systemImage: "eye")
+                            }
+                        }
+                        Divider()
+                        Toggle("심플 모드 (STT · 번역 성능 집중)", isOn: $model.simpleFastMode)
                         Button(model.t("panel.coachWindow")) { openWindow(id: "coach") }
                         Divider()
                         Button(model.t("panel.swapVertical")) {
                             withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() }
                         }
                         Button(model.t("panel.resetOrder")) {
-                            withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.reset() }
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showSummaryScriptPanel = true
+                                model.showTranslationKeywords = true
+                                columnVisibility = .all
+                                model.panelLayout.reset()
+                            }
                         }
-                    } label: { Label("보기", systemImage: "rectangle.3.group") }.labelStyle(.iconOnly)
+                    } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Label("패널 표시", systemImage: "rectangle.3.group").labelStyle(.iconOnly)
+                            if anyPanelHidden {
+                                Circle()
+                                    .fill(Color.accentColor)
+                                    .frame(width: 6, height: 6)
+                                    .offset(x: 2, y: -2)
+                            }
+                        }
+                    }
+                    .help(anyPanelHidden ? "패널 표시 / 숨기기 (일부 패널 숨겨짐 · 클릭하여 복원)" : "패널 표시 / 숨기기 및 배치 관리")
                     Button {
                         if model.listening { model.pauseListening() } else { Task { await model.start() } }
                     } label: { Label(model.finishingCapture ? model.t("action.finishingAudio") : model.starting ? (model.settings.stt == .managed || model.settings.translation == .managed ? model.t("action.preparingModel") : model.t("action.checkingPermissions")) : model.listening ? model.t("action.stopListening") : model.t("action.startListening"), systemImage: model.listening ? "stop.fill" : "mic.fill") }
@@ -348,16 +505,17 @@ struct ContentView: View {
                         Text(status).foregroundStyle(.orange)
                     }.font(.caption)
                 }
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Label(model.t("live.header"), systemImage: "waveform.circle.fill").font(.headline).foregroundStyle(.blue)
                     Picker("범위", selection: $model.recentSeconds) {
                         Text(model.t("range.all")).tag(0)
                         Text(model.t("range.2min")).tag(120)
                         Text(model.t("range.1min")).tag(60)
                     }
-                        .labelsHidden().frame(width: 120)
-                    Picker("보기", selection: $linkedConversationView) { Text(model.t("view.linked")).tag(true); Text(model.t("view.3panel")).tag(false) }
-                        .labelsHidden().frame(width: 110)
+                        .labelsHidden().frame(width: 104)
+                    Picker("보기", selection: $linkedConversationView) { Text(model.t("view.linked")).tag(true); Text(model.simpleFastMode ? "2패널 보기" : model.t("view.3panel")).tag(false) }
+                        .labelsHidden().frame(width: 98)
+                    QuickAudioSourceMenu(model: model)
                     Menu {
                         Section(model.t("settings.sourceLanguage")) {
                             Button {
@@ -389,6 +547,7 @@ struct ContentView: View {
                     .fixedSize()
                     .disabled(model.starting)
                     .help(model.t("settings.sourceLanguage"))
+                    QuickSTTModelMenu(model: model) { showingModels = true }
                     Menu {
                         Section(model.t("settings.targetLanguage")) {
                             ForEach(LanguageCatalog.all) { lang in
@@ -423,6 +582,7 @@ struct ContentView: View {
                     .menuStyle(.borderlessButton)
                     .fixedSize()
                     .help("\(model.t("settings.targetLanguage")) · \(model.t("settings.uiLanguage"))")
+                    QuickTranslationModelMenu(model: model) { showingModels = true }
                     Spacer()
                     if !model.followLive {
                         Text(model.hasUnreadLiveChanges ? model.t("reading.pausedReceiving") : model.t("reading.paused")).font(.caption.bold()).foregroundStyle(.orange)
@@ -431,8 +591,9 @@ struct ContentView: View {
                         if model.followLive { model.pauseReading() } else { model.resumeReading() }
                     } label: { Label(model.followLive ? model.t("reading.pause") : model.t("reading.resume"), systemImage: model.followLive ? "pause.circle" : "arrow.down.to.line") }
                 }.controlSize(.small)
+                let effectiveShowSummary = !model.simpleFastMode && showSummaryScriptPanel && model.panelLayout.hasAnySummaryScriptVisible
                 if linkedConversationView {
-                    let linkedSides: [String] = showSummaryScriptPanel
+                    let linkedSides: [String] = effectiveShowSummary
                         ? (model.panelLayout.linkedSummaryOnLeft ? ["linked-summary", "linked-main"] : ["linked-main", "linked-summary"])
                         : ["linked-main"]
                     HSplitView {
@@ -452,9 +613,11 @@ struct ContentView: View {
                                         dragHelp: model.t("panel.dragHint"),
                                         onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
                                         onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
-                                        extraActionIcon: "arrow.up.arrow.down",
+                                        extraActionIcon: (model.panelLayout.isVisible(.summary) && model.panelLayout.isVisible(.script)) ? "arrow.up.arrow.down" : nil,
                                         extraActionHelp: model.t("panel.swapVertical"),
-                                        onExtraAction: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() } }
+                                        onExtraAction: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() } },
+                                        hideHelp: "요약 · 스크립트 패널 숨기기",
+                                        onHide: { withAnimation(.easeInOut(duration: 0.18)) { showSummaryScriptPanel = false } }
                                     )
                                     SummaryScriptPanel(model: model)
                                 }
@@ -472,7 +635,7 @@ struct ContentView: View {
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    if showSummaryScriptPanel {
+                                    if effectiveShowSummary {
                                         PanelReorderBar(
                                             title: model.t("view.linked"),
                                             icon: "rectangle.split.2x1",
@@ -504,11 +667,22 @@ struct ContentView: View {
                         }
                     }.frame(minHeight: 300)
                 } else {
-                    let visiblePanels = model.panelLayout.visibleSplitPanels(includeSummaryScript: showSummaryScriptPanel)
+                    let allVisible = model.panelLayout.visibleSplitPanels(includeSummaryScript: effectiveShowSummary)
+                    let visiblePanels = model.simpleFastMode
+                        ? allVisible.filter { $0 == .stt || $0 == .translation }
+                        : allVisible
                     HSplitView {
                         ForEach(Array(visiblePanels.enumerated()), id: \.element) { index, panel in
                             let isFirst = index == 0
                             let isLast = index == visiblePanels.count - 1
+                            let canHideThisPanel: Bool = {
+                                switch panel {
+                                case .stt: return model.panelLayout.canHide(.stt, includeCoach: !model.simpleFastMode)
+                                case .translation: return model.panelLayout.canHide(.translation, includeCoach: !model.simpleFastMode)
+                                case .coach: return model.panelLayout.canHide(.coach, includeCoach: true)
+                                case .summaryScript: return true
+                                }
+                            }()
                             VStack(alignment: .leading, spacing: 6) {
                                 PanelReorderBar(
                                     title: panel.title(in: model.uiLanguage),
@@ -521,18 +695,29 @@ struct ContentView: View {
                                     dragHelp: model.t("panel.dragHint"),
                                     onMoveLeft: {
                                         withAnimation(.easeInOut(duration: 0.2)) {
-                                            model.panelLayout.move(panel, by: -1, includeSummaryScript: showSummaryScriptPanel)
+                                            model.panelLayout.move(panel, by: -1, includeSummaryScript: effectiveShowSummary)
                                         }
                                     },
                                     onMoveRight: {
                                         withAnimation(.easeInOut(duration: 0.2)) {
-                                            model.panelLayout.move(panel, by: 1, includeSummaryScript: showSummaryScriptPanel)
+                                            model.panelLayout.move(panel, by: 1, includeSummaryScript: effectiveShowSummary)
                                         }
                                     },
-                                    extraActionIcon: panel == .summaryScript ? "arrow.up.arrow.down" : nil,
+                                    extraActionIcon: (panel == .summaryScript && model.panelLayout.isVisible(.summary) && model.panelLayout.isVisible(.script)) ? "arrow.up.arrow.down" : nil,
                                     extraActionHelp: panel == .summaryScript ? model.t("panel.swapVertical") : nil,
                                     onExtraAction: panel == .summaryScript ? {
                                         withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() }
+                                    } : nil,
+                                    hideHelp: "\(panel.title(in: model.uiLanguage)) 패널 숨기기",
+                                    onHide: canHideThisPanel ? {
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            switch panel {
+                                            case .stt: model.panelLayout.setVisible(.stt, false, includeCoach: !model.simpleFastMode)
+                                            case .translation: model.panelLayout.setVisible(.translation, false, includeCoach: !model.simpleFastMode)
+                                            case .coach: model.panelLayout.setVisible(.coach, false, includeCoach: true)
+                                            case .summaryScript: showSummaryScriptPanel = false
+                                            }
+                                        }
                                     } : nil
                                 )
                                 splitPanelContent(for: panel)
@@ -679,6 +864,7 @@ struct CoachView: View {
                     .background(Color.accentColor.opacity(0.12), in: Capsule())
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                PanelFontButton(title: "대화 코치", value: $model.panelTypography.advice, defaultValue: 18)
                 if !model.followLive { Button(model.t("reading.resume")) { model.resumeReading() }.font(.caption) }
                 if model.generating { ProgressView().controlSize(.small) }
             }
@@ -792,11 +978,12 @@ struct TranslationView: View {
                     .fixedSize()
                     .help(model.t("settings.targetLanguage"))
                 }
+                PanelFontButton(title: "번역", value: $model.panelTypography.translation, defaultValue: 19)
                 if model.translating { ProgressView().controlSize(.small) }
             }
-            if model.showTranslationKeywords { TranslationKeywordsView(model: model) }
+            if !model.simpleFastMode && model.showTranslationKeywords { TranslationKeywordsView(model: model) }
             Text(model.translationEngineDescription).font(.caption).foregroundStyle(.secondary)
-            Text("2~3문장씩 묶어 번역 · 잠시 멈추면 잔여 문장 처리").font(.caption2).foregroundStyle(.secondary)
+            Text(model.simpleFastMode ? "심플 패스트 · 한 문장씩 모아서 즉시 번역" : "한 문장씩 모아서 번역 · 잠시 멈추면 잔여 발화 처리").font(.caption2).foregroundStyle(.secondary)
             Text(model.translationStatus).font(.caption2).foregroundStyle(.secondary)
             if let error = model.translationError { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             Toggle("전체 번역 기록", isOn: $showHistory).font(.caption)
@@ -848,12 +1035,25 @@ struct TranslationView: View {
         }
     }
     private func translationPair(source: String, translated: String, latest: Bool = true) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if latest { Text("최신 번역").font(.caption.bold()) }
-            Text(source).font(.caption).foregroundStyle(latest ? Color.white.opacity(0.85) : Color.secondary).textSelection(.enabled)
+        let sourceTag = TranslationPolicy.sourceTag(of: source)
+        let isMic = sourceTag == "마이크"
+        let displaySource = sourceTag == nil ? source : TranslationPolicy.displayText(strippingSourceTag: source)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                if sourceTag != nil {
+                    Label(isMic ? "내 목소리" : "Mac 소리", systemImage: isMic ? "mic.fill" : "speaker.wave.2.fill")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(latest ? Color.white.opacity(0.20) : (isMic ? Color.teal : Color.blue).opacity(0.15), in: Capsule())
+                        .foregroundStyle(latest ? Color.white : (isMic ? Color.teal : Color.blue))
+                }
+                if latest { Text("최신 번역").font(.caption.bold()) }
+            }
+            Text(displaySource).font(.caption).foregroundStyle(latest ? Color.white.opacity(0.85) : Color.secondary).textSelection(.enabled)
             Text(translated).font(.system(size: model.panelTypography.translation, weight: .medium)).lineSpacing(5).textSelection(.enabled)
         }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
-            .modifier(RecentCardStyle(color: LiveColors.translation, latest: latest))
+            .modifier(RecentCardStyle(color: isMic ? Color.teal : LiveColors.translation, latest: latest))
     }
 }
 
@@ -862,13 +1062,68 @@ struct SummaryPanel: View {
     @State private var scope = "all"
     @State private var showingHistory = false
     var body: some View {
+        let activeLanguages = model.resolvedSummaryLanguages(for: model.displayConversation?.transcript)
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Label(model.t("panel.summary"), systemImage: "list.bullet.rectangle").font(.headline)
-                Spacer()
+                Menu {
+                    Section("기본 요약 언어") {
+                        Button {
+                            model.updateSummaryLanguages { $0.includeTranslationLanguage.toggle() }
+                        } label: {
+                            Label("번역 언어 (\(model.targetLanguageName))", systemImage: model.summaryLanguages.includeTranslationLanguage ? "checkmark" : "circle")
+                        }
+                        Button {
+                            model.updateSummaryLanguages { $0.includeSTTLanguage.toggle() }
+                        } label: {
+                            Label("STT 언어 (\(model.sttLanguageBadge))", systemImage: model.summaryLanguages.includeSTTLanguage ? "checkmark" : "circle")
+                        }
+                    }
+                    Divider()
+                    Section("추가 요약 언어 (복수 선택)") {
+                        ForEach(LanguageCatalog.all) { lang in
+                            let selected = model.summaryLanguages.extraLanguageCodes.contains(lang.code)
+                            Button {
+                                model.updateSummaryLanguages { $0.toggleExtra(lang.code) }
+                            } label: {
+                                if selected {
+                                    Label(lang.displayName(in: model.uiLanguage), systemImage: "checkmark")
+                                } else {
+                                    Text(lang.displayName(in: model.uiLanguage))
+                                }
+                            }
+                        }
+                    }
+                    if !model.summaryLanguages.extraLanguageCodes.isEmpty {
+                        Divider()
+                        Button("추가 언어 모두 해제") {
+                            model.updateSummaryLanguages { $0.extraLanguageCodes = [] }
+                        }
+                    }
+                } label: {
+                    Label(model.summaryLanguageBadge, systemImage: "globe")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.12), in: Capsule())
+                        .lineLimit(1)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("요약 생성 언어 선택 (STT + 번역 + 추가 복수 언어)")
+                Spacer(minLength: 4)
+                PanelFontButton(title: "대화 요약", value: $model.panelTypography.summary, defaultValue: 16)
                 if model.summarizing { ProgressView().controlSize(.small) }
                 Button(model.t("summary.history")) { showingHistory = true }.controlSize(.small)
                 Button(model.t("summary.refresh")) { Task { await model.refreshSummaries() } }.controlSize(.small).disabled(model.summarizing)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { model.panelLayout.setVisible(.summary, false) }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("대화 요약 패널 숨기기")
             }
             HStack(spacing: 8) {
                 Picker("요약 범위", selection: $scope) {
@@ -881,16 +1136,16 @@ struct SummaryPanel: View {
             ScrollView {
                 if scope == "all" {
                     if let summary = model.displayConversation?.summaries?["all"] {
-                        summaryCard(label: "전체 대화", summary: summary, color: .accentColor)
+                        summaryCard(label: "전체 대화", summary: summary, languages: activeLanguages, color: .accentColor)
                     } else {
-                        Text("대화가 쌓이면 핵심 내용·결정 사항·할 일·미해결 질문을 정리합니다.").font(.caption).foregroundStyle(.secondary).padding(.top, 10)
+                        Text("대화가 쌓이면 핵심 내용·결정 사항·할 일·미해결 질문을 선택한 언어로 정리합니다.").font(.caption).foregroundStyle(.secondary).padding(.top, 10)
                     }
                 } else {
                     let speakers = Array(Set((model.displayConversation?.turns ?? []).compactMap(\.speaker))).sorted()
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(speakers, id: \.self) { speaker in
                             if let summary = model.displayConversation?.summaries?["speaker-\(speaker)"] {
-                                summaryCard(label: "화자 \(speaker) · 추정", summary: summary, color: speakerColor(speaker))
+                                summaryCard(label: "화자 \(speaker) · 추정", summary: summary, languages: activeLanguages, color: speakerColor(speaker))
                             } else { Text("화자 \(speaker) · 요약 대기 중").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
                         }
                         if speakers.isEmpty { Text("화자가 구분되면 화자별로 발언을 정리합니다.").font(.caption).foregroundStyle(.secondary) }
@@ -918,14 +1173,51 @@ struct SummaryPanel: View {
             }.padding(24).frame(width: 640, height: 600)
         }
     }
-    private func summaryCard(label: String, summary: SummaryState, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private func summaryCard(label: String, summary: SummaryState, languages: [SupportedLanguage], color: Color) -> some View {
+        let localizedMap = summary.localizedTexts ?? [:]
+        let primaryCode = summary.primaryLanguageCode ?? languages.first?.code ?? model.targetLanguageSpec.code
+        let renderedLanguages: [(lang: SupportedLanguage, text: String?)] = languages.map { lang in
+            if let text = localizedMap[lang.code], !text.isEmpty {
+                return (lang, text)
+            }
+            if lang.code == primaryCode {
+                return (lang, summary.text)
+            }
+            return (lang, nil)
+        }
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(label).font(.caption.bold()).foregroundStyle(color)
                 Spacer()
                 Text(summary.updatedAt, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
             }
-            Text(summary.text).font(.system(size: model.panelTypography.summary)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            if renderedLanguages.count <= 1 {
+                Text(renderedLanguages.first?.text ?? summary.text)
+                    .font(.system(size: model.panelTypography.summary))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ForEach(Array(renderedLanguages.enumerated()), id: \.element.lang.code) { idx, pair in
+                    if idx > 0 { Divider() }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(pair.lang.displayName(in: model.uiLanguage))
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(color.opacity(0.14), in: Capsule())
+                            .foregroundStyle(color)
+                        if let text = pair.text, !text.isEmpty {
+                            Text(text)
+                                .font(.system(size: model.panelTypography.summary))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            Text(model.summarizing ? "요약 생성 중…" : "‘갱신’을 누르면 이 언어로 요약을 생성합니다.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }.padding(12).background(color.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
     }
 }

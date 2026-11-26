@@ -68,6 +68,7 @@ extension AppModel {
         }
     }
     private func finishPendingAnalysis() async {
+        guard !simpleFastMode else { return }
         if showTranslationKeywords { await extractKeywords(automatic: true) }
         await refreshSummaries()
         await organizeScript(automatic: true)
@@ -90,6 +91,7 @@ extension AppModel {
             if settings.stt == .managed || settings.translation == .managed { sttStatus = "자체 모델 서버 준비 중…" }
             if settings.stt == .managed { try await managedModels.ensureReady(.stt) }
             if settings.translation == .managed { try await managedModels.ensureReady(.translation) }
+            warmUpTranslationEngine()
             let recorder = audioRecorder
             let shouldRecord = recordAudioForReplay && id != nil
             if shouldRecord, let conversationID = id {
@@ -121,15 +123,15 @@ extension AppModel {
                     }
                 }
                 if settings.stt == .managed {
-                    try await managedMic.start(language: language, externalAudio: false, inputDeviceUID: selectedInputUID, key: managedModels.authorization(.stt), onText: { [weak self] text in
+                    try await managedMic.start(language: effectiveMicWhisperLanguage, externalAudio: false, inputDeviceUID: selectedInputUID, key: managedModels.authorization(.stt), onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
                         self.receiveDuplex(source: "마이크", text: text, prefix: prefix)
                     }, onError: { [weak self] error in
                         guard let self, self.captureRun == run else { return }; self.handleCaptureFailure(error)
                     }, onLatency: { [weak self] ms in self?.managedModels.record(.stt, latency: ms) }, onAudioBuffer: micAudioSink)
-                    speakerStatus = "자체 Whisper STT · 무음 경계/최대 3초 묶음 · 입력 경로 구분 (화자 분리 미지원)"
+                    speakerStatus = "자체 Whisper STT · 무음 경계/최대 2.5초 묶음 · 내 마이크 + 입력 경로 구분"
                 } else if settings.stt == .deepgram {
-                    try await cloudCapture.start(key: SecretStore.read("deepgram"), inputDeviceUID: selectedInputUID, language: language, onUpdate: { [weak self] full, stable, turns in
+                    try await cloudCapture.start(key: SecretStore.read("deepgram"), inputDeviceUID: selectedInputUID, language: effectiveMicWhisperLanguage, onUpdate: { [weak self] full, stable, turns in
                         guard let self, self.selectedID == id, self.captureRun == run else { return }
                         if self.includeSystemAudio {
                             self.receiveDuplex(source: "마이크", text: full, prefix: prefix)
@@ -152,7 +154,7 @@ extension AppModel {
                     speakerStatus = "Deepgram 화자 구분 · 언어 전환 자동 인식"
                 } else {
                     stableCloudTranscript = nil
-                    let appleLocale = language == LanguageCatalog.autoCode ? "en-US" : language
+                    let appleLocale = effectiveMicAppleLocale
                     try await capture.start(locale: appleLocale, inputDeviceUID: selectedInputUID, onTurns: { [weak self] turns in
                         guard let self, self.selectedID == id, self.captureRun == run, !self.includeSystemAudio,
                               let index = self.conversations.firstIndex(where: { $0.id == id }) else { return }
@@ -230,17 +232,18 @@ extension AppModel {
             summaryTask = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(12))
-                    guard !Task.isCancelled else { return }
-                    await self?.refreshSummaries()
+                    guard !Task.isCancelled, let self else { return }
+                    if !self.simpleFastMode { await self.refreshSummaries() }
                 }
             }
             timer = Task { [weak self] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
+                    let tickSeconds: Double = (self?.simpleFastMode ?? false) ? 0.9 : 2.0
+                    try? await Task.sleep(for: .milliseconds(Int(tickSeconds * 1000)))
                     guard !Task.isCancelled, let self else { return }
                     if self.hasUnsavedChanges { self.save() }
                     self.translateLatest(automatic: true)
-                    if self.autoAdvice || self.showTranslationKeywords { await self.refreshAssistance() }
+                    if !self.simpleFastMode && (self.autoAdvice || self.showTranslationKeywords) { await self.refreshAssistance() }
                 }
             }
         } catch {

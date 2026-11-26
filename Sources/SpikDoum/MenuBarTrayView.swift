@@ -99,6 +99,21 @@ struct MenuBarTrayView: View {
                 .disabled(model.starting)
             }
 
+            Toggle(isOn: $model.simpleFastMode) {
+                Label("심플 패스트 모드 (STT · 번역 전용)", systemImage: model.simpleFastMode ? "bolt.fill" : "bolt")
+                    .font(.caption)
+                    .foregroundStyle(model.simpleFastMode ? Color.orange : Color.primary)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+
+            HStack(spacing: 6) {
+                QuickAudioSourceMenu(model: model, compact: true)
+                QuickSTTModelMenu(model: model, compact: true)
+                QuickTranslationModelMenu(model: model, compact: true)
+                Spacer(minLength: 0)
+            }
+
             if let error = model.message ?? model.deviceError {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
