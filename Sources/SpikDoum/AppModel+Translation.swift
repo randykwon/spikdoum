@@ -104,21 +104,31 @@ extension AppModel {
                 let targetSpec = self.targetLanguageSpec
                 let isMicTurn = TranslationPolicy.sourceTag(of: source) == "마이크"
                 let translated: String
+                let detectedSourceCode: String?
+                let effectiveTargetCode: String
                 if cleanedSource.isEmpty {
                     translated = "…"
+                    detectedSourceCode = nil
+                    effectiveTargetCode = targetSpec.code
                 } else {
+                    let preferredCodes = self.autoLanguagePrefs.preferredCodes
+                    let sentenceDetection = LanguageCatalog.detectLanguageDetailed(for: cleanedSource, preferredCodes: preferredCodes)
                     let detectedSpec: SupportedLanguage?
                     if isMicTurn {
-                        detectedSpec = LanguageCatalog.detectLanguage(for: cleanedSource) ?? (self.micLanguageMode == .autoOrTarget ? targetSpec : self.sourceLanguageSpec)
+                        detectedSpec = sentenceDetection?.language ?? (self.micLanguageMode == .autoOrTarget ? targetSpec : self.sourceLanguageSpec)
                     } else if self.language == LanguageCatalog.autoCode {
-                        detectedSpec = LanguageCatalog.detectLanguage(for: cleanedSource) ?? self.detectedSTTLanguage
+                        detectedSpec = sentenceDetection?.language ?? self.detectedSTTLanguage
+                    } else if let strong = sentenceDetection, strong.confidence >= 0.85, strong.language.shortCode != self.sourceLanguageSpec?.shortCode {
+                        // Even in fixed-language mode, respect unmistakable script switches (e.g. Japanese/Korean spoken in an English call).
+                        detectedSpec = strong.language
                     } else {
                         detectedSpec = self.sourceLanguageSpec
                     }
                     // Two-way mic translation: if the user speaks in their own target language (e.g. Korean)
                     // while listening to a foreign-language meeting (e.g. Japanese/English), translate the user's
-                    // microphone turn into the partner's STT language so both directions appear side by side.
-                    let partnerSpec = self.sourceLanguageSpec ?? self.detectedSTTLanguage
+                    // microphone turn into the most recently heard foreign partner language.
+                    let recentForeignPartner = self.recentDetectedLanguages.first { $0.translationCode != targetSpec.translationCode }
+                    let partnerSpec = self.sourceLanguageSpec ?? recentForeignPartner ?? self.detectedSTTLanguage
                     let effectiveTarget: SupportedLanguage
                     if isMicTurn,
                        let detectedSpec,
@@ -129,6 +139,8 @@ extension AppModel {
                     } else {
                         effectiveTarget = targetSpec
                     }
+                    detectedSourceCode = detectedSpec?.code
+                    effectiveTargetCode = effectiveTarget.code
                     let sourceShort = detectedSpec?.shortCode ?? LanguageCatalog.whisperLanguageParameter(for: self.language)
                     if self.settings.translation == .managed {
                         translated = try await self.managedModels.translate(
@@ -159,14 +171,14 @@ extension AppModel {
                 guard !translated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CloudFailure(message: "번역 결과가 비어 있습니다.") }
                 self.liveTranslation = translated
                 guard TranslationPolicy.isCurrent(work, transcript: self.conversations[index].transcript) else {
-                    self.translationPreview = TranslationEntry(source: source, translated: self.liveTranslation, targetLanguage: targetSpec.code)
+                    self.translationPreview = TranslationEntry(source: source, translated: self.liveTranslation, sourceLanguageCode: detectedSourceCode, targetLanguage: effectiveTargetCode)
                     self.translationStatus = "원문 수정 반영 중 · 아래 번역은 표시된 원문 기준"
                     self.liveTranslation = ""
                     self.translationSource = ""
                     return
                 }
                 self.translationLatency = Int(Date().timeIntervalSince(started) * 1000)
-                let entry = TranslationEntry(source: source, translated: self.liveTranslation, targetLanguage: targetSpec.code, sourceStart: work.start, sourceEnd: work.end)
+                let entry = TranslationEntry(source: source, translated: self.liveTranslation, sourceLanguageCode: detectedSourceCode, targetLanguage: effectiveTargetCode, sourceStart: work.start, sourceEnd: work.end)
                 if self.conversations[index].translations == nil { self.conversations[index].translations = [] }
                 self.conversations[index].translations?.append(entry)
                 self.translationPreview = nil

@@ -726,3 +726,658 @@ import Testing
     #expect(!layout.hasHiddenPanels)
     #expect(layout.visibleSplitPanels(includeSummaryScript: true) == PanelLayout.defaultOrder)
 }
+
+@Test func managedAudioBuffererDropsSamplesWhileMutedAndResumesImmediately() async throws {
+    let format = try #require(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false))
+    final class Collector: @unchecked Sendable {
+        let lock = NSLock()
+        var chunks: [Data] = []
+        func append(_ data: Data) { lock.lock(); chunks.append(data); lock.unlock() }
+        func snapshot() -> [Data] { lock.lock(); defer { lock.unlock() }; return chunks }
+    }
+    let collector = Collector()
+    let bufferer = ManagedAudioBufferer()
+    bufferer.start { collector.append($0) }
+
+    func feed(samples: Int, amplitude: Float) throws {
+        var sent = 0
+        while sent < samples {
+            let count = min(1600, samples - sent)
+            let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)))
+            buffer.frameLength = AVAudioFrameCount(count)
+            for i in 0..<count {
+                buffer.floatChannelData![0][i] = amplitude * Float(sin(Double(sent + i) * 2 * .pi * 440 / 16000))
+            }
+            bufferer.append(buffer)
+            sent += count
+        }
+    }
+
+    // While muted, 2.0s of loud speech should emit zero chunks.
+    bufferer.setMuted(true)
+    try feed(samples: 16000 * 2, amplitude: 0.25)
+    try feed(samples: 16000 * 3 / 10, amplitude: 0)
+    try await Task.sleep(for: .milliseconds(80))
+    #expect(collector.snapshot().isEmpty)
+
+    // After unmuting, speech emits chunks normally again.
+    bufferer.setMuted(false)
+    try feed(samples: 16000 * 12 / 10, amplitude: 0.25)
+    try feed(samples: 16000 * 3 / 10, amplitude: 0)
+    _ = await bufferer.finish()
+    #expect(collector.snapshot().count == 1)
+}
+
+@Test func speechRecognitionTransientErrorsIncludeXPCAndServerBusy() {
+    let xpcInterrupted = NSError(domain: NSCocoaErrorDomain, code: 4097, userInfo: nil)
+    let xpcInvalidated = NSError(domain: NSCocoaErrorDomain, code: 4099, userInfo: nil)
+    let serverBusy = NSError(domain: "kAFAssistantErrorDomain", code: 201, userInfo: nil)
+    let lsrTransient = NSError(domain: "kLSRErrorDomain", code: 300, userInfo: nil)
+    let siriDisabled = NSError(domain: "kAFAssistantErrorDomain", code: 1700, userInfo: nil)
+    let denied = NSError(domain: "kAFAssistantErrorDomain", code: 201, userInfo: [NSLocalizedDescriptionKey: "Speech recognition denied by user"])
+
+    #expect(SpeechRecognitionPolicy.isTransientError(xpcInterrupted))
+    #expect(SpeechRecognitionPolicy.isTransientError(xpcInvalidated))
+    #expect(SpeechRecognitionPolicy.isTransientError(serverBusy))
+    #expect(SpeechRecognitionPolicy.isTransientError(lsrTransient))
+    #expect(!SpeechRecognitionPolicy.isTransientError(siriDisabled))
+    #expect(!SpeechRecognitionPolicy.isTransientError(denied))
+}
+
+@Test func recentSummaryWindowSlicesLiveAndFinishedConversationsAndExportsMarkdown() {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    var conversation = Conversation(
+        date: now.addingTimeInterval(-40 * 60),
+        title: "주간 싱크",
+        transcript: "35분전발언\n12분전발언\n4분전발언\n90초전발언\n30초전발언"
+    )
+    conversation.transcriptSpans = [
+        TranscriptSpan(date: now.addingTimeInterval(-35 * 60), start: 0, text: "35분전발언\n"),
+        TranscriptSpan(date: now.addingTimeInterval(-12 * 60), start: 7, text: "12분전발언\n"),
+        TranscriptSpan(date: now.addingTimeInterval(-4 * 60), start: 14, text: "4분전발언\n"),
+        TranscriptSpan(date: now.addingTimeInterval(-90), start: 20, text: "90초전발언\n"),
+        TranscriptSpan(date: now.addingTimeInterval(-30), start: 27, text: "30초전발언")
+    ]
+
+    #expect(RecentSummaryWindow.allCases.map(\.minutes) == [1, 2, 3, 5, 10, 30])
+
+    let live1 = SummaryPolicy.recentTranscript(for: conversation, window: .min1, referenceDate: now, isListening: true)
+    #expect(live1.text == "30초전발언")
+    #expect(live1.spanCount == 1)
+    #expect(!live1.anchoredToLastActivity)
+
+    let live2 = SummaryPolicy.recentTranscript(for: conversation, window: .min2, referenceDate: now, isListening: true)
+    #expect(live2.text.contains("90초전발언"))
+    #expect(live2.text.contains("30초전발언"))
+    #expect(!live2.text.contains("4분전발언"))
+
+    let live5 = SummaryPolicy.recentTranscript(for: conversation, window: .min5, referenceDate: now, isListening: true)
+    #expect(live5.text.contains("4분전발언"))
+    #expect(!live5.text.contains("12분전발언"))
+
+    let live30 = SummaryPolicy.recentTranscript(for: conversation, window: .min30, referenceDate: now, isListening: true)
+    #expect(live30.text.contains("12분전발언"))
+    #expect(!live30.text.contains("35분전발언"))
+
+    // Reviewing a finished conversation 2 hours later anchors to its last recorded span.
+    let later = now.addingTimeInterval(2 * 3600)
+    let finished5 = SummaryPolicy.recentTranscript(for: conversation, window: .min5, referenceDate: later, isListening: false)
+    #expect(finished5.anchoredToLastActivity)
+    #expect(finished5.text.contains("4분전발언"))
+    #expect(!finished5.text.contains("12분전발언"))
+
+    // Saved recent-window summaries are exported cleanly to Markdown.
+    conversation.summaries = [
+        RecentSummaryWindow.min5.summaryKey: SummaryState(text: "• 최근 5분 핵심 정리", coveredSource: live5.text, updatedAt: now)
+    ]
+    let md = ConversationExport.markdown(for: conversation)
+    #expect(md.contains("## 구간별 요약"))
+    #expect(md.contains("### 최근 5분"))
+    #expect(md.contains("• 최근 5분 핵심 정리"))
+}
+
+@Test func presentationNotesParserSplitsHeadingsDurationsAndNativeNotes() {
+    let md = """
+    # 오프닝 [2분]
+    - Welcome everyone to today's talk.
+    - Let's review Q3 goals.
+    > 미소 유지, 천천히 시작
+
+    ## 라이브 데모 (4.5m)
+    - Switching to live screen now.
+    > 화면 공유 상태 확인
+
+    # 마무리 [90s]
+    - Thank you! Any questions?
+    """
+
+    let cards = PresentationNotesParser.parse(md)
+    #expect(cards.count == 3)
+    #expect(cards[0].title == "오프닝")
+    #expect(cards[0].plannedMinutes == 2.0)
+    #expect(cards[0].bodyLines.count == 2)
+    #expect(cards[0].subNotes == ["미소 유지, 천천히 시작"])
+
+    #expect(cards[1].title == "라이브 데모")
+    #expect(cards[1].plannedMinutes == 4.5)
+    #expect(cards[1].subNotes == ["화면 공유 상태 확인"])
+
+    #expect(cards[2].title == "마무리")
+    #expect(cards[2].plannedMinutes == 1.5)
+}
+
+@Test func presentationChecklistMatcherHandlesAliasesAndRespectsManualOverride() {
+    var items = [
+        PresentationChecklistItem(title: "35% 비용 절감 / 35% / thirty-five percent"),
+        PresentationChecklistItem(title: "보안 인증, SOC2"),
+        PresentationChecklistItem(title: "Q4 로드맵", isChecked: false, autoMatched: false, manuallyOverridden: true)
+    ]
+
+    let result = PresentationChecklistMatcher.apply(
+        transcript: "We achieved thirty five percent reduction and completed SOC 2 and Q4 로드맵.",
+        to: items
+    )
+    #expect(result.changed)
+    items = result.items
+    #expect(items[0].isChecked && items[0].autoMatched)
+    #expect(items[1].isChecked && items[1].autoMatched)
+    // Manually overridden item must not be auto-checked back.
+    #expect(!items[2].isChecked)
+
+    // Cloning a presentation resets elapsed time and checklist completion while preserving content.
+    var session = PresentationSession(
+        targetMinutes: 20,
+        notesMarkdown: "# Intro [2분]\n- Hello",
+        activeCardIndex: 2,
+        checklist: items,
+        elapsedSeconds: 420,
+        inQAMode: true
+    )
+    let cloned = session.clonedForNewRun()
+    #expect(cloned.targetMinutes == 20)
+    #expect(cloned.notesMarkdown == session.notesMarkdown)
+    #expect(cloned.activeCardIndex == 0)
+    #expect(cloned.elapsedSeconds == 0)
+    #expect(!cloned.inQAMode)
+    #expect(cloned.checklist.count == 3)
+    #expect(cloned.checklist.allSatisfy { !$0.isChecked && !$0.manuallyOverridden })
+    session.checklist = items
+    var convo = Conversation(title: "발표", transcript: "test")
+    convo.presentation = session
+    let md = ConversationExport.markdown(for: convo)
+    #expect(md.contains("## 프레젠테이션 요약"))
+    #expect(md.contains("필수 언급 체크리스트: 2/3 완료"))
+}
+
+@Test func speakingPaceCalculatorMeasuresEnglishWPMAndKoreanCPM() {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let enSpans = [
+        TranscriptSpan(date: now.addingTimeInterval(-17), start: 0, text: "[마이크] Today I want to share three important milestones from our engineering team this quarter."),
+        TranscriptSpan(date: now.addingTimeInterval(-5), start: 95, text: "[마이크] First we reduced end to end latency dramatically across all regions."),
+        TranscriptSpan(date: now.addingTimeInterval(-3), start: 170, text: "[Mac 재생음] This audience speech should be ignored for presenter pace.")
+    ]
+    let enPace = SpeakingPaceCalculator.calculate(spans: enSpans, referenceDate: now)
+    #expect(enPace.unitLabel == "WPM")
+    #expect(enPace.rate > 40 && enPace.rate < 220)
+    #expect(enPace.zone != .idle)
+
+    let koSpans = [
+        TranscriptSpan(date: now.addingTimeInterval(-15), start: 0, text: "안녕하세요 오늘 발표에서는 지난 분기 핵심 성과와 다음 분기 계획을 공유드리겠습니다. 특히 실시간 지연 시간을 크게 단축했습니다.")
+    ]
+    let koPace = SpeakingPaceCalculator.calculate(spans: koSpans, referenceDate: now)
+    #expect(koPace.unitLabel == "자/분")
+    #expect(koPace.rate > 100)
+}
+
+@Test func speedQualityTierResolvesFiveStagesForSTTAndTranslation() {
+    let installedAll: Set<String> = [
+        "whisper-tiny", "whisper-base", "whisper-small",
+        "whisper-large-v3-turbo-q5", "whisper-large-v3-q5",
+        "qwen25-05b-q4", "qwen25-15b-q4", "qwen3-4b-q4"
+    ]
+
+    // Tier 1 (Ultra Fast): English + Parakeet ready picks Parakeet ANE; Japanese picks Apple modern streaming; Translation picks Apple.
+    let enTier1 = SpeedQualityTier.ultraFast.resolveSTTPlan(languageCode: "en-US", installedWhisperIDs: installedAll, parakeetReady: true, appleModernReady: true)
+    #expect(enTier1.engine == .parakeet)
+    let jaTier1 = SpeedQualityTier.ultraFast.resolveSTTPlan(languageCode: "ja-JP", installedWhisperIDs: installedAll, parakeetReady: true, appleModernReady: true)
+    #expect(jaTier1.engine == .apple)
+    #expect(SpeedQualityTier.ultraFast.resolveTranslationPlan(installedTranslationIDs: installedAll).engine == .apple)
+
+    // Tiers 2..5 progress from fast streaming to max accuracy batch with tighter/wider audio context.
+    let koTier2 = SpeedQualityTier.fast.resolveSTTPlan(languageCode: "ko-KR", installedWhisperIDs: installedAll, parakeetReady: true, appleModernReady: false)
+    #expect(koTier2.engine == .managed && koTier2.managedModelID == "whisper-base")
+    #expect(koTier2.streamingInterval == 0.35 && koTier2.audioContext == 384)
+    #expect(SpeedQualityTier.fast.resolveTranslationPlan(installedTranslationIDs: installedAll).managedModelID == "qwen25-05b-q4")
+
+    let tier3 = SpeedQualityTier.balanced.resolveSTTPlan(languageCode: "ko-KR", installedWhisperIDs: installedAll, parakeetReady: false, appleModernReady: false)
+    #expect(tier3.managedModelID == "whisper-small" && tier3.streamingInterval == 0.45)
+    #expect(SpeedQualityTier.balanced.resolveTranslationPlan(installedTranslationIDs: installedAll).managedModelID == "qwen25-15b-q4")
+
+    let tier4 = SpeedQualityTier.accurate.resolveSTTPlan(languageCode: "ko-KR", installedWhisperIDs: installedAll, parakeetReady: false, appleModernReady: false)
+    #expect(tier4.managedModelID == "whisper-large-v3-turbo-q5" && tier4.streamingInterval == 0.55 && tier4.audioContext == 512)
+    #expect(SpeedQualityTier.accurate.resolveTranslationPlan(installedTranslationIDs: installedAll).managedModelID == "qwen3-4b-q4")
+
+    let tier5 = SpeedQualityTier.maxAccuracy.resolveSTTPlan(languageCode: "ja-JP", installedWhisperIDs: installedAll, parakeetReady: false, appleModernReady: false)
+    #expect(tier5.managedModelID == "whisper-large-v3-q5" && tier5.streamingInterval == nil && tier5.audioContext == 768 && tier5.bestOf == 2)
+
+    let whisperArgs = ManagedModelManager.arguments(role: .stt, model: URL(fileURLWithPath: "/tmp/m.bin"), audioContext: 384, bestOf: 1)
+    #expect(whisperArgs.contains("-ac") && whisperArgs.contains("384"))
+}
+
+@Test func localAgreementStabilizesStreamingInterimAndPCM16ConvertsCleanly() {
+    var tracker = LocalAgreementTracker()
+    let h1 = tracker.update(hypothesis: "Hello everyone today we")
+    #expect(h1 == "Hello everyone today we")
+    let h2 = tracker.update(hypothesis: "Hello everyone today we will discuss latency")
+    #expect(tracker.confirmedPrefix == "Hello everyone today we")
+    #expect(h2 == "Hello everyone today we will discuss latency")
+    // Transient truncation shorter than agreed prefix keeps the confirmed prefix steady.
+    let h3 = tracker.update(hypothesis: "Hello")
+    #expect(h3 == "Hello everyone today we")
+    tracker.reset()
+    #expect(tracker.confirmedPrefix.isEmpty)
+
+    // PCM16 little-endian to Float32 conversion for Parakeet ANE.
+    var samples: [Int16] = ([0, 16384, -16384] as [Int16]).map { $0.littleEndian }
+    let data = Data(bytes: &samples, count: samples.count * 2)
+    let floats = ParakeetModelManager.pcm16ToFloats(data)
+    #expect(floats.count == 3)
+    #expect(abs(floats[0]) < 0.0001)
+    #expect(abs(floats[1] - 0.5) < 0.001)
+    #expect(abs(floats[2] + 0.5) < 0.001)
+}
+
+@Test func presentationAdvisorRecommendsByDurationContentAndLiveContext() {
+    #expect(SignpostCategory.allCases.count == 8)
+    #expect(PresentationDurationProfile.profile(for: 5).tier == .lightning)
+    #expect(PresentationDurationProfile.profile(for: 15).tier == .standard)
+    #expect(PresentationDurationProfile.profile(for: 30).tier == .deepDive)
+
+    var session = PresentationSession(
+        targetMinutes: 15,
+        notesMarkdown: """
+        # 오프닝 훅 [2분]
+        - Did you know latency costs 35% of user drop-off?
+
+        # 라이브 데모 [6분]
+        - Let me switch to a live demo of Q3 rollout.
+
+        # 성과 데이터 [5분]
+        - Look at the chart showing 3x speed improvement.
+        """
+    )
+
+    let instant = PresentationAdvisor.instantRecommend(session: session, languageCode: "en-US")
+    #expect(instant.checklist.contains { $0.title.contains("35%") })
+    #expect(instant.checklist.contains { $0.title.contains("Q3") })
+    #expect(instant.phrases.contains { $0.category == .demo || $0.category == .visuals })
+
+    let cards = PresentationNotesParser.parse(session.notesMarkdown)
+    // Active card = Demo → surfaces Demo & Glitch Recovery phrases.
+    let demoCtx = PresentationAdvisor.contextualLiveRecommendation(session: session, cards: cards, activeCardIndex: 1, languageCode: "en-US")
+    #expect(demoCtx.category == .demo)
+    #expect(!demoCtx.phrases.isEmpty)
+
+    // Active card = Data/Chart → surfaces Visuals & Data phrases.
+    let chartCtx = PresentationAdvisor.contextualLiveRecommendation(session: session, cards: cards, activeCardIndex: 2, languageCode: "en-US")
+    #expect(chartCtx.category == .visuals)
+
+    // Approaching end of talk (85% elapsed) → overrides with Time Control / Closing phrases.
+    session.elapsedSeconds = 13 * 60
+    let closingCtx = PresentationAdvisor.contextualLiveRecommendation(session: session, cards: cards, activeCardIndex: 1, languageCode: "en-US")
+    #expect(closingCtx.category == .timeControl)
+
+    // AI JSON recommendation parsing (including fenced JSON).
+    let aiJSON = """
+    ```json
+    {
+      "rationale": "15분 발표에 맞춰 수치·데모·마무리 3축으로 구성했습니다.",
+      "checklist": [
+        {"title": "35% 지연 단축 / 35% / thirty-five", "stage": "핵심 수치", "minute": 4}
+      ],
+      "phrases": [
+        {"category": "visuals", "phrase": "Look at the sharp 35% drop on the right.", "meaning": "35% 감소 차트 시선 유도"}
+      ]
+    }
+    ```
+    """
+    let parsed = PresentationAdvisor.parseAIRecommendationJSON(aiJSON, languageCode: "en-US", rationaleFallback: "")
+    #expect(parsed != nil)
+    #expect(parsed?.isAIGenerated == true)
+    #expect(parsed?.checklist.first?.stageTag == "핵심 수치")
+    #expect(parsed?.checklist.first?.targetMinute == 4)
+    #expect(parsed?.phrases.first?.category == .visuals)
+}
+
+@Test func enhancedMultilingualAutoDetectionHandlesShortCJKCodeSwitchingCandidatesAndWhisperNames() {
+    // 1. Short non-Latin utterances & code-switched phrases are detected reliably via script-first heuristics.
+    #expect(LanguageCatalog.detectLanguage(for: "감사")?.code == "ko-KR")
+    #expect(LanguageCatalog.detectLanguage(for: "はい")?.code == "ja-JP")
+    #expect(LanguageCatalog.detectLanguage(for: "API 에러 확인해 주세요")?.code == "ko-KR")
+    #expect(LanguageCatalog.detectLanguage(for: "Q3 レビュー 시작")?.code == "ja-JP")
+    #expect(LanguageCatalog.detectLanguage(for: "สวัสดีครับ")?.code == "th-TH")
+    #expect(LanguageCatalog.detectLanguage(for: "مرحبا بكم")?.code == "ar-SA")
+    #expect(LanguageCatalog.detectLanguage(for: "नमस्ते")?.code == "hi-IN")
+
+    // 2. Pure Kanji disambiguates to Japanese when preferred candidates include Japanese without Chinese.
+    let kanjiForJA = LanguageCatalog.detectLanguageDetailed(for: "会議資料", preferredCodes: ["ko-KR", "ja-JP"])
+    #expect(kanjiForJA?.language.code == "ja-JP")
+
+    // 3. Whisper acoustic verbose_json language names map cleanly to SupportedLanguage.
+    #expect(LanguageCatalog.language(forWhisperName: "japanese")?.code == "ja-JP")
+    #expect(LanguageCatalog.language(forWhisperName: "korean")?.code == "ko-KR")
+    #expect(LanguageCatalog.language(forWhisperName: "chinese")?.code == "zh-CN")
+    #expect(LanguageCatalog.language(forWhisperName: "thai")?.code == "th-TH")
+
+    // 4. Parakeet ANE auto mode is enabled only when candidate languages are all European.
+    #expect(SpeedQualityTier.supportsParakeet(languageCode: "auto", preferredAutoCodes: ["en-US", "de-DE", "fr-FR"]))
+    #expect(!SpeedQualityTier.supportsParakeet(languageCode: "auto", preferredAutoCodes: ["en-US", "ko-KR"]))
+    #expect(!SpeedQualityTier.supportsParakeet(languageCode: "auto", preferredAutoCodes: []))
+}
+
+@Test func pptxImporterParsesDrawingMLSlidesNotesRelsAndFormatsCueCards() {
+    let slideXML = Data("""
+    <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <p:cSld><p:spTree>
+        <p:sp><p:txBody>
+          <a:p><a:r><a:t>Q3 Performance Review</a:t></a:r></a:p>
+          <a:p><a:r><a:t>Latency reduced by 35%</a:t></a:r></a:p>
+          <a:p><a:r><a:t>1</a:t></a:r></a:p>
+        </p:txBody></p:sp>
+      </p:spTree></p:cSld>
+    </p:sld>
+    """.utf8)
+    let paragraphs = PPTXSlideImporter.parseDrawingMLParagraphs(slideXML)
+    #expect(paragraphs == ["Q3 Performance Review", "Latency reduced by 35%", "1"])
+
+    let relsXML = Data("""
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide4.xml"/>
+    </Relationships>
+    """.utf8)
+    #expect(PPTXSlideImporter.parseNotesTarget(fromRels: relsXML) == "ppt/notesSlides/notesSlide4.xml")
+
+    let slides = [
+        ImportedPPTSlide(
+            number: 1,
+            title: "Q3 Performance Review",
+            bullets: ["Latency reduced by 35%", "Zero downtime"],
+            speakerNotes: ["Start with the latency hook and pause 2 seconds."]
+        ),
+        ImportedPPTSlide(
+            number: 2,
+            title: "Live Demo",
+            bullets: ["Walk through real-time translation"],
+            speakerNotes: []
+        )
+    ]
+    let markdown = PPTXSlideImporter.formatAsCueCardMarkdown(slides: slides, totalMinutes: 10)
+    #expect(markdown.contains("# 1. Q3 Performance Review [5분]"))
+    #expect(markdown.contains("- Start with the latency hook and pause 2 seconds."))
+    #expect(markdown.contains("> 슬라이드 화면: Latency reduced by 35% · Zero downtime"))
+    let cards = PresentationNotesParser.parse(markdown)
+    #expect(cards.count == 2)
+    #expect(cards[0].plannedMinutes == 5.0)
+    #expect(cards[1].title == "2. Live Demo")
+}
+
+@MainActor @Test func sttLowLatencyOptimizationsProtectTurboContextUseFastJSONAndIsolateLiveCaption() {
+    // 1. Default ManagedSTTClient request uses compact "json" (skips slow token timestamp alignment).
+    let wave = ManagedSTTClient.wave(pcm: Data([1, 0, 2, 0]))
+    let fastReq = ManagedSTTClient(key: "k").request(wave: wave, language: "auto")
+    let fastBody = String(decoding: fastReq.httpBody!, as: UTF8.self)
+    #expect(fastBody.contains("name=\"response_format\"\r\n\r\njson"))
+    #expect(!fastBody.contains("verbose_json"))
+
+    // 2. Large-v3 / turbo models clamp -ac >= 512 so positional embeddings cannot corrupt; smaller models keep 384.
+    let turboArgs = ManagedModelManager.arguments(
+        role: .stt,
+        model: URL(fileURLWithPath: "/tmp/ggml-large-v3-turbo-q5_0.bin"),
+        audioContext: 384,
+        bestOf: 1
+    )
+    if let acIdx = turboArgs.firstIndex(of: "-ac"), acIdx + 1 < turboArgs.count {
+        #expect(turboArgs[acIdx + 1] == "512")
+    } else {
+        Issue.record("Missing -ac flag for turbo model")
+    }
+    let smallArgs = ManagedModelManager.arguments(
+        role: .stt,
+        model: URL(fileURLWithPath: "/tmp/ggml-small.bin"),
+        audioContext: 384,
+        bestOf: 1
+    )
+    if let acIdx = smallArgs.firstIndex(of: "-ac"), acIdx + 1 < smallArgs.count {
+        #expect(smallArgs[acIdx + 1] == "384")
+    } else {
+        Issue.record("Missing -ac flag for small model")
+    }
+
+    // 3. Tier 1 (Ultra Fast) in multilingual "auto" mode picks ultra-fast Whisper instead of fixed-locale Apple STT.
+    let autoTier1 = SpeedQualityTier.ultraFast.resolveSTTPlan(
+        languageCode: "auto",
+        installedWhisperIDs: ["whisper-tiny", "whisper-base"],
+        parakeetReady: true,
+        appleModernReady: true
+    )
+    #expect(autoTier1.engine == .managed && autoTier1.managedModelID == "whisper-tiny")
+
+    // 4. LiveSTTDisplayStore isolates partial updates per source and clears cleanly.
+    let live = LiveSTTDisplayStore()
+    live.update(text: "Hello world", sourceTag: "Mac 재생음")
+    #expect(live.text == "Hello world" && live.sourceTag == "Mac 재생음")
+    live.update(text: "네 알겠습니다", sourceTag: "마이크")
+    #expect(live.text == "네 알겠습니다" && live.sourceTag == "마이크")
+    live.clear(sourceTag: "마이크")
+    #expect(live.text == "Hello world" && live.sourceTag == "Mac 재생음")
+    live.clear()
+    #expect(live.text.isEmpty && live.sourceTag == nil)
+
+    // 5. RecentActivity append fast-path matches incremental span growth.
+    let t0 = Date()
+    let s1 = RecentActivity.update(old: "", new: "First sentence.", spans: [], at: t0)
+    let s2 = RecentActivity.update(old: "First sentence.", new: "First sentence. Second sentence.", spans: s1, at: t0.addingTimeInterval(2))
+    #expect(s2.count == 1 && s2[0].text == "First sentence. Second sentence.")
+    let s3 = RecentActivity.update(old: s2[0].text, new: s2[0].text + " Later.", spans: s2, at: t0.addingTimeInterval(15))
+    #expect(s3.count == 2 && s3[1].start == s2[0].end && s3[1].text == " Later.")
+}
+
+@MainActor @Test func managedLocalLLMAndTaskRoutingConfigureDedicatedServerAndOverrides() throws {
+    // 1. Dedicated managed LLM server uses port 18884, 8K context, 2 parallel slots, reasoning off, and loopback binding.
+    #expect(ManagedRole.llm.port == 18884)
+    #expect(ManagedRole.llm.executable == "llama-server")
+    let llmArgs = ManagedModelManager.arguments(role: .llm, model: URL(fileURLWithPath: "/tmp/Qwen3-4B-Q4_K_M.gguf"))
+    #expect(llmArgs.contains("127.0.0.1"))
+    #expect(llmArgs.contains("18884"))
+    #expect(llmArgs.contains("8192"))
+    #expect(llmArgs.contains("--parallel"))
+    if let pIdx = llmArgs.firstIndex(of: "--parallel"), pIdx + 1 < llmArgs.count {
+        #expect(llmArgs[pIdx + 1] == "2")
+    } else {
+        Issue.record("Missing --parallel flag for managed LLM")
+    }
+    #expect(llmArgs.contains("--reasoning") && llmArgs.contains("off"))
+
+    // 2. Per-task LLM routing defaults to main LLM and supports independent keyword/summary overrides.
+    var settings = EngineSettings()
+    settings.llm = .managed
+    #expect(settings.effectiveLLM(for: .coach) == .managed)
+    #expect(settings.effectiveLLM(for: .summary) == .managed)
+    #expect(settings.effectiveLLM(for: .keywords) == .managed)
+    #expect(!settings.usesAppleLLMForAnyTask)
+
+    settings.keywordLLM = .apple
+    settings.summaryLLM = .openAI
+    #expect(settings.effectiveLLM(for: .coach) == .managed)
+    #expect(settings.effectiveLLM(for: .keywords) == .apple)
+    #expect(settings.effectiveLLM(for: .summary) == .openAI)
+    #expect(settings.usesAppleLLMForAnyTask)
+
+    // 3. Legacy EngineSettings JSON without keywordLLM/summaryLLM decodes cleanly to .followMain.
+    let legacyJSON = Data("{\"stt\":\"apple\",\"translation\":\"apple\",\"llm\":\"managed\"}".utf8)
+    let decoded = try JSONDecoder().decode(EngineSettings.self, from: legacyJSON)
+    #expect(decoded.llm == .managed)
+    #expect(decoded.keywordLLM == .followMain)
+    #expect(decoded.summaryLLM == .followMain)
+
+    // 4. LLMClient respects engineOverride when a task uses a different provider than settings.llm.
+    settings.cloudModel = "gpt-4.1-mini"
+    let openAIReq = try LLMClient(settings: settings, key: "sk-test", engineOverride: .openAI)
+        .request(instructions: "Summarize", input: "Hello")
+    #expect(openAIReq.url?.host == "api.openai.com")
+    let localReq = try LLMClient(settings: settings, key: "", engineOverride: .compatible)
+        .request(instructions: "Summarize", input: "Hello")
+    #expect(localReq.url?.host == "localhost")
+}
+
+@Test func powerPointRemoteParsesSlideSnapshotsAndBuildsValidControlScripts() {
+    // 1. Parse full PowerPoint slide show snapshot with deck name and blackout state.
+    let running = PPTSlideSyncMonitor.parseSnapshot("PowerPoint|4|15|1|black|Q3_Roadmap.pptx")
+    #expect(running == PPTSlideSnapshot(
+        appName: "PowerPoint",
+        presentationName: "Q3_Roadmap.pptx",
+        currentSlide: 4,
+        totalSlides: 15,
+        isSlideShowRunning: true,
+        screenMode: .black
+    ))
+
+    // 2. Parse edit-mode PowerPoint snapshot and Keynote snapshot.
+    let editMode = PPTSlideSyncMonitor.parseSnapshot("PowerPoint|2|10|0|normal|Demo | Deck.pptx")
+    #expect(editMode?.currentSlide == 2 && editMode?.totalSlides == 10 && editMode?.isSlideShowRunning == false && editMode?.presentationName == "Demo | Deck.pptx")
+    let keynote = PPTSlideSyncMonitor.parseSnapshot("Keynote|7|20|1|normal|Launch.key")
+    #expect(keynote?.appName == "Keynote" && keynote?.currentSlide == 7 && keynote?.isSlideShowRunning == true)
+
+    // 3. Reject empty or malformed snapshots safely.
+    #expect(PPTSlideSyncMonitor.parseSnapshot("") == nil)
+    #expect(PPTSlideSyncMonitor.parseSnapshot("PowerPoint|0|10|0|normal|bad") == nil)
+    #expect(PPTSlideSyncMonitor.parseSnapshot("invalid") == nil)
+
+    // 4. Verify path parsing, live notes extraction, merging, and explicit timing preservation.
+    let withPath = PPTSlideSyncMonitor.parseSnapshot("PowerPoint|3|22|1|normal|Demo | Deck.pptx\t/Users/me/Demo | Deck.pptx")
+    #expect(withPath?.presentationName == "Demo | Deck.pptx")
+    #expect(withPath?.presentationPath == "/Users/me/Demo | Deck.pptx")
+    #expect(withPath?.currentSlide == 3 && withPath?.totalSlides == 22 && withPath?.isSlideShowRunning == true)
+
+    let notesScriptPPT = PPTSlideSyncMonitor.buildNotesExportScript(for: .powerPoint)
+    #expect(notesScriptPPT.contains("notes page of sl"))
+    #expect(notesScriptPPT.contains("<<<SPIK_SLIDE>>>"))
+    let notesScriptKeynote = PPTSlideSyncMonitor.buildNotesExportScript(for: .keynote)
+    #expect(notesScriptKeynote.contains("presenter notes of sl"))
+
+    // 5. Parse live PowerPoint CR-delimited notes, merge onto disk PPTX titles/bullets, and keep >6 lines + explicit timing.
+    let liveRaw = "<<<SPIK_SLIDE>>>1<<<SPIK_FIELD>>><<<SPIK_FIELD>>>예상 배분 시간: 0:45 (누적 0:45)\r라인1\r라인2\r라인3\r라인4\r라인5\r라인6\r라인7\r1<<<SPIK_SLIDE>>>2<<<SPIK_FIELD>>>Custom Live Title<<<SPIK_FIELD>>>Live edited note"
+    let parsedLive = PPTSlideSyncMonitor.parseLiveSlides(liveRaw)
+    #expect(parsedLive.count == 2)
+    #expect(parsedLive[0].title == "슬라이드 1")
+    #expect(parsedLive[0].speakerNotes.count == 8) // standalone "1" filtered out, all 8 lines preserved
+    #expect(parsedLive[1].title == "Custom Live Title")
+
+    let diskBase = [
+        ImportedPPTSlide(number: 1, title: "온톨로지 재무 AI", bullets: ["핵심 아키텍처", "성과 요약"], speakerNotes: ["Old saved note"])
+    ]
+    let merged = PPTSlideSyncMonitor.mergeLiveNotes(baseSlides: diskBase, liveSlides: parsedLive)
+    #expect(merged.count == 2)
+    #expect(merged[0].title == "온톨로지 재무 AI")
+    #expect(merged[0].bullets == ["핵심 아키텍처", "성과 요약"])
+    #expect(merged[0].speakerNotes.contains("라인7"))
+    let mergedMD = PPTXSlideImporter.formatAsCueCardMarkdown(slides: merged, totalMinutes: 20)
+    #expect(mergedMD.contains("# 1. 온톨로지 재무 AI [0:45]"))
+    #expect(mergedMD.contains("- 라인7")) // no longer truncated at 6 lines!
+    let mergedCards = PresentationNotesParser.parse(mergedMD)
+    #expect(mergedCards.count == 2)
+    #expect(mergedCards[0].plannedSeconds == 45)
+
+    // 6. Verify generated AppleScript commands cover all presentation remote actions.
+    let startWindowed = PPTSlideSyncMonitor.buildControlScript(for: .startShowFromBeginning(.windowed))
+    #expect(startWindowed.contains("run slide show"))
+    #expect(startWindowed.contains("slide show type window"))
+    #expect(startWindowed.contains("set ending slide of sss to totalCnt"))
+    #expect(startWindowed.contains("slide show range show all"))
+
+    let startFullFromCurrent = PPTSlideSyncMonitor.buildControlScript(for: .startShowFromCurrent(.fullScreen))
+    #expect(startFullFromCurrent.contains("slide show type speaker"))
+    #expect(startFullFromCurrent.contains("set ending slide of sss to totalCnt"))
+    #expect(startFullFromCurrent.contains("go to next slide ssv"))
+
+    let nextScript = PPTSlideSyncMonitor.buildControlScript(for: .nextSlide)
+    #expect(nextScript.contains("go to next slide"))
+    #expect(nextScript.contains("go to slide (view of active window)"))
+
+    let prevScript = PPTSlideSyncMonitor.buildControlScript(for: .previousSlide)
+    #expect(prevScript.contains("go to previous slide"))
+
+    let jumpScript = PPTSlideSyncMonitor.buildControlScript(for: .goToSlide(5))
+    #expect(jumpScript.contains("set targetIdx to 5"))
+
+    let blackScript = PPTSlideSyncMonitor.buildControlScript(for: .toggleBlackScreen)
+    #expect(blackScript.contains("slide show state black screen"))
+
+    let whiteScript = PPTSlideSyncMonitor.buildControlScript(for: .toggleWhiteScreen)
+    #expect(whiteScript.contains("slide show state white screen"))
+
+    let endScript = PPTSlideSyncMonitor.buildControlScript(for: .endShow)
+    #expect(endScript.contains("exit slide show"))
+}
+
+@MainActor @Test(.enabled(if: ProcessInfo.processInfo.environment["SPIKDOUM_PPT_E2E"] == "1"))
+func powerPointLiveEndToEndSlideShowControl() async throws {
+    let monitor = PPTSlideSyncMonitor()
+    func runAction(_ action: PPTControlAction) async throws {
+        monitor.perform(action)
+        for _ in 0..<120 {
+            if !monitor.isSendingCommand { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(monitor.lastControlError == nil, "Action \(action) failed: \(monitor.lastControlError ?? "")")
+    }
+
+    // 1. Fetch live presenter notes from the currently open PowerPoint deck
+    let notesOutcome = await PPTSlideSyncMonitor.fetchActivePresentationSlides()
+    switch notesOutcome {
+    case .success(let fetched):
+        #expect(!fetched.slides.isEmpty)
+        #expect(fetched.slides.contains { !$0.speakerNotes.isEmpty })
+    case .failure(let error):
+        Issue.record("Live PowerPoint notes fetch failed: \(error.localizedDescription)")
+    }
+
+    // 2. Start windowed slide show from beginning
+    try await runAction(.startShowFromBeginning(.windowed))
+    #expect(monitor.connectedApp == "PowerPoint")
+    #expect(monitor.isSlideShowRunning == true)
+    #expect(monitor.currentSlideNumber == 1)
+
+    // 2. Next slide, jump to slide 5, previous slide
+    try await runAction(.nextSlide)
+    #expect(monitor.currentSlideNumber == 2)
+    try await runAction(.goToSlide(5))
+    #expect(monitor.currentSlideNumber == 5)
+    try await runAction(.previousSlide)
+    #expect(monitor.currentSlideNumber == 4)
+
+    // 3. Black screen & white screen toggles
+    try await runAction(.toggleBlackScreen)
+    #expect(monitor.screenMode == .black)
+    try await runAction(.toggleWhiteScreen)
+    #expect(monitor.screenMode == .white)
+    try await runAction(.toggleWhiteScreen)
+    #expect(monitor.screenMode == .normal)
+
+    // 4. End show, move to slide 3 in edit mode, then start from current slide (#3)
+    try await runAction(.endShow)
+    #expect(monitor.isSlideShowRunning == false)
+    try await runAction(.goToSlide(3))
+    #expect(monitor.currentSlideNumber == 3)
+    try await runAction(.startShowFromCurrent(.windowed))
+    #expect(monitor.isSlideShowRunning == true)
+    #expect(monitor.currentSlideNumber == 3)
+
+    // 5. Step back to slide 2 (proving full range is preserved!), end show, restore slide 1
+    try await runAction(.previousSlide)
+    #expect(monitor.currentSlideNumber == 2)
+    try await runAction(.endShow)
+    #expect(monitor.isSlideShowRunning == false)
+    try await runAction(.firstSlide)
+    #expect(monitor.currentSlideNumber == 1)
+}

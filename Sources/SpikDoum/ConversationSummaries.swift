@@ -76,6 +76,33 @@ struct SummaryWork {
     var covered: String
     var previous: String
 }
+
+enum RecentSummaryWindow: Int, CaseIterable, Identifiable, Codable, Sendable {
+    case min1 = 1
+    case min2 = 2
+    case min3 = 3
+    case min5 = 5
+    case min10 = 10
+    case min30 = 30
+
+    var id: Int { rawValue }
+    var minutes: Int { rawValue }
+    var seconds: TimeInterval { TimeInterval(rawValue * 60) }
+    var summaryKey: String { "recent-\(rawValue)m" }
+    var shortLabel: String { "\(rawValue)분" }
+    var title: String { "최근 \(rawValue)분" }
+}
+
+struct RecentSummarySlice: Equatable, Sendable {
+    var window: RecentSummaryWindow
+    var text: String
+    var cutoff: Date
+    var reference: Date
+    var spanCount: Int
+    var anchoredToLastActivity: Bool
+    var usedFallbackFullTranscript: Bool
+}
+
 enum SummaryPolicy {
     static func parseDigest(_ text: String) throws -> SummaryDigest {
         var json = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -96,5 +123,79 @@ enum SummaryPolicy {
         let chunk = String(pending.prefix(1800))
         return SummaryWork(source: chunk, covered: (incremental ? prefix : "") + chunk,
                            previous: incremental ? String((state?.text ?? "").suffix(2200)) : "")
+    }
+
+    /// Extracts the conversation remarks spoken within the requested recent time window.
+    /// - While listening, anchors to `referenceDate` (now) so "최근 N분" reflects live wall-clock time.
+    /// - When stopped / reviewing an older conversation, anchors to the conversation's latest recorded timestamp
+    ///   so "최근 N분" summarizes the final N minutes of that conversation.
+    static func recentTranscript(
+        for conversation: Conversation,
+        window: RecentSummaryWindow,
+        referenceDate: Date = Date(),
+        isListening: Bool
+    ) -> RecentSummarySlice {
+        let spans = conversation.transcriptSpans ?? []
+        let datedTranslations = (conversation.translations ?? []).compactMap { entry -> (date: Date, text: String)? in
+            guard let date = entry.date else { return nil }
+            let trimmed = entry.source.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : (date, trimmed)
+        }
+        let latestActivity = spans.map(\.date).max() ?? datedTranslations.map(\.date).max()
+        let anchoredToLastActivity = !isListening && latestActivity != nil
+        let reference = anchoredToLastActivity ? (latestActivity ?? referenceDate) : referenceDate
+        let cutoff = reference.addingTimeInterval(-window.seconds)
+
+        if !spans.isEmpty {
+            let matching = spans.filter { $0.date >= cutoff && $0.date <= reference.addingTimeInterval(1) }
+            let joined = matching.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            return RecentSummarySlice(
+                window: window,
+                text: joined,
+                cutoff: cutoff,
+                reference: reference,
+                spanCount: matching.count,
+                anchoredToLastActivity: anchoredToLastActivity,
+                usedFallbackFullTranscript: false
+            )
+        }
+
+        if !datedTranslations.isEmpty {
+            let matching = datedTranslations.filter { $0.date >= cutoff && $0.date <= reference.addingTimeInterval(1) }
+            let joined = matching.map(\.text).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return RecentSummarySlice(
+                window: window,
+                text: joined,
+                cutoff: cutoff,
+                reference: reference,
+                spanCount: matching.count,
+                anchoredToLastActivity: anchoredToLastActivity,
+                usedFallbackFullTranscript: false
+            )
+        }
+
+        // Legacy conversations saved before per-span timestamps existed.
+        let full = conversation.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !full.isEmpty && (!isListening || conversation.date >= cutoff) {
+            return RecentSummarySlice(
+                window: window,
+                text: full,
+                cutoff: cutoff,
+                reference: reference,
+                spanCount: 1,
+                anchoredToLastActivity: !isListening,
+                usedFallbackFullTranscript: true
+            )
+        }
+
+        return RecentSummarySlice(
+            window: window,
+            text: "",
+            cutoff: cutoff,
+            reference: reference,
+            spanCount: 0,
+            anchoredToLastActivity: anchoredToLastActivity,
+            usedFallbackFullTranscript: false
+        )
     }
 }

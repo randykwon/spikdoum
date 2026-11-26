@@ -35,12 +35,111 @@ final class AudioLevelMonitor: ObservableObject {
     @Published var level: Double = 0
 }
 
+/// Dedicated ultra-lightweight observable store for live uncommitted STT hypotheses.
+/// Updating this store redraws ONLY the live caption row (<0.2ms) instead of invalidating
+/// `ContentView`, the sidebar, `ConversationBlocks`, `SummaryScriptPanel`, or triggering disk saves.
+@MainActor
+final class LiveSTTDisplayStore: ObservableObject {
+    @Published private(set) var text: String = ""
+    @Published private(set) var sourceTag: String? = nil
+    @Published private(set) var updatedAt: Date = .distantPast
+    private var perSource: [String: String] = [:]
+
+    func update(text raw: String, sourceTag: String?) {
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = sourceTag ?? "_default"
+        if cleaned.isEmpty {
+            perSource.removeValue(forKey: key)
+        } else {
+            perSource[key] = cleaned
+        }
+        let nextText: String
+        let nextTag: String?
+        if !cleaned.isEmpty {
+            nextText = cleaned
+            nextTag = sourceTag
+        } else if let remaining = perSource.first {
+            nextText = remaining.value
+            nextTag = remaining.key == "_default" ? nil : remaining.key
+        } else {
+            nextText = ""
+            nextTag = nil
+        }
+        if self.text != nextText || self.sourceTag != nextTag {
+            self.text = nextText
+            self.sourceTag = nextTag
+            self.updatedAt = Date()
+        }
+    }
+
+    func clear(sourceTag: String? = nil) {
+        if let sourceTag {
+            update(text: "", sourceTag: sourceTag)
+            return
+        }
+        perSource.removeAll()
+        if !text.isEmpty || self.sourceTag != nil {
+            text = ""
+            self.sourceTag = nil
+            updatedAt = .distantPast
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     let managedModels = ManagedModelManager()
     let managedMic = ManagedSpeechCapture()
     let managedSystem = ManagedSpeechCapture()
+    let parakeetModels = ParakeetModelManager()
+    let parakeetMic = ParakeetSpeechCapture()
+    let parakeetSystem = ParakeetSpeechCapture()
+    let appleSpeechAssets = AppleSpeechAssetManager()
+    let pptSlideSync = PPTSlideSyncMonitor()
+    let liveSTT = LiveSTTDisplayStore()
+    @Published var sttTier = SpeedQualityTier.loadSTT() {
+        didSet { sttTier.saveSTT() }
+    }
+    @Published var translationTier = SpeedQualityTier.loadTranslation() {
+        didSet { translationTier.saveTranslation() }
+    }
     @Published var finishingCapture = false
+    @Published var perspective: AppPerspective = AppPerspective.load() {
+        didSet { perspective.save() }
+    }
+    @Published var hideFromScreenShare = false
+    @Published var presentationTimerRunning = false
+    @Published var compressingCueCards = false
+    @Published var recommendingPresentation = false
+    @Published var presentationRecommendation: PresentationRecommendation? = nil
+    @Published var presentationError: String?
+    @Published var linkedPPTNotesPendingUpdate: String? = nil
+    var presentationTimerTask: Task<Void, Never>?
+    var presentationCompressToken = UUID()
+    var presentationRecommendToken = UUID()
+    @Published var micMuted = false {
+        didSet {
+            applyMicMuteState()
+            guard oldValue != micMuted, listening, !systemAudioOnly else { return }
+            if micMuted {
+                sttStatus = includeSystemAudio ? "내 마이크 음소거 · Mac 재생음 수신 중" : "내 마이크 음소거됨"
+            } else {
+                sttStatus = includeSystemAudio ? "마이크 + Mac 재생음 수신 중" : "마이크 연결됨 · 음성 대기"
+            }
+        }
+    }
+    func applyMicMuteState() {
+        let effectiveMute = micMuted && !systemAudioOnly
+        capture.setMuted(effectiveMute)
+        managedMic.setMuted(effectiveMute)
+        parakeetMic.setMuted(effectiveMute)
+        cloudCapture.setMuted(effectiveMute)
+    }
+    @Published var topHeaderCollapsed = UserDefaults.standard.bool(forKey: "topHeaderCollapsedV1") {
+        didSet {
+            UserDefaults.standard.set(topHeaderCollapsed, forKey: "topHeaderCollapsedV1")
+        }
+    }
     @Published var simpleFastMode = UserDefaults.standard.bool(forKey: "simpleFastMode") {
         didSet {
             UserDefaults.standard.set(simpleFastMode, forKey: "simpleFastMode")
@@ -66,6 +165,7 @@ final class AppModel: ObservableObject {
     }
     @Published var panelTypography = PanelTypography.load() { didSet { panelTypography.save() } }
     @Published var panelLayout = PanelLayout.load() { didSet { panelLayout.save() } }
+    var cueCardToken = UUID()
     @Published var sttAppearance = STTAppearance.load() { didSet { sttAppearance.save() } }
     @Published var settings = EngineSettings.load() {
         didSet {
@@ -78,6 +178,11 @@ final class AppModel: ObservableObject {
                 || oldValue.azureRegion != settings.azureRegion
                 || oldValue.localTranslation != settings.localTranslation {
                 reloadTranslationEngineAfterSettingsChange()
+            }
+            if oldValue.llm != settings.llm
+                || oldValue.keywordLLM != settings.keywordLLM
+                || oldValue.summaryLLM != settings.summaryLLM {
+                refreshModelStatus()
             }
         }
     }
@@ -250,9 +355,12 @@ final class AppModel: ObservableObject {
 
     var activeSTTModelLabel: String {
         switch settings.stt {
-        case .apple: return "Apple STT"
+        case .apple:
+            let locale = isAutoDetectLanguage ? lastFixedLanguage : language
+            return appleSpeechAssets.isInstalled(for: locale) ? "Apple 실시간 STT" : "Apple STT"
         case .deepgram: return "Deepgram"
         case .managed: return managedModels.selected(.stt)?.name ?? "Whisper"
+        case .parakeet: return "Parakeet ANE"
         }
     }
 
@@ -262,6 +370,132 @@ final class AppModel: ObservableObject {
         case .azure: return "Azure 번역"
         case .local: return "로컬 번역"
         case .managed: return managedModels.selected(.translation)?.name ?? "자체 번역"
+        }
+    }
+
+    var activeLLMModelLabel: String {
+        switch settings.llm {
+        case .apple: return "Apple AI"
+        case .managed:
+            if let name = managedModels.selected(.llm)?.name {
+                return name.replacingOccurrences(of: " Instruct", with: "").replacingOccurrences(of: " · Q4", with: "")
+            }
+            return "자체 LLM"
+        case .openAI:
+            let model = settings.cloudModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return model.isEmpty ? "OpenAI" : model
+        case .compatible:
+            let model = settings.serverModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return model.isEmpty ? "외부 LLM" : model
+        }
+    }
+
+    var isHybridFastPresetActive: Bool {
+        sttTier == .ultraFast
+            && settings.translation == .apple
+            && settings.llm != .apple
+    }
+
+    /// One-click Hybrid Fast Architecture:
+    /// Real-time fast lane (Ultra-fast STT + Apple ~30ms on-device translation)
+    /// + Intelligence lane (Dedicated local Qwen3/Gemma LLM or configured cloud/server LLM for coaching, summaries, keywords).
+    func applyHybridFastPreset() async {
+        await applySTTTier(.ultraFast, announce: false)
+        await applyTranslationTier(.ultraFast, announce: false)
+        if let bestLocal = managedModels.bestInstalledLLMModel() {
+            await switchLLMEngine(.managed, managedModelID: bestLocal.id, announce: false)
+            Task { [weak self] in
+                _ = try? await self?.managedModels.ensureReady(.llm)
+            }
+        } else if settings.llm == .apple {
+            // Keep Apple AI if no local GGUF model is installed yet, and inform the user clearly.
+            presetNotice = "초고속 STT + Apple 번역 적용됨 · 코치·요약용 자체 LLM(Qwen3 4B 등)을 모델 관리에서 다운로드하면 하이브리드 모드가 완성됩니다."
+            return
+        }
+        presetNotice = "⚡ 초고속 하이브리드 적용 · STT: \(activeSTTModelLabel) · 번역: Apple 번역(~30ms) · 코치·요약: \(activeLLMModelLabel)"
+    }
+
+    func switchLLMEngine(_ engine: LLMEngine, managedModelID: String? = nil, announce: Bool = true) async {
+        let previousEngine = settings.llm
+        let previousModelID = managedModels.selectedLLM
+        if engine == .managed {
+            let targetModel: ManagedModel?
+            if let managedModelID {
+                targetModel = managedModels.models(for: .llm).first { $0.id == managedModelID && managedModels.installed.contains($0.id) }
+            } else if let current = managedModels.selected(.llm), managedModels.installed.contains(current.id) {
+                targetModel = current
+            } else {
+                targetModel = managedModels.bestInstalledLLMModel()
+            }
+            guard let chosen = targetModel else {
+                message = "설치된 자체 로컬 LLM(.gguf) 모델이 없습니다. 모델 관리에서 Qwen3 4B 등을 다운로드해주세요."
+                return
+            }
+            if previousModelID != chosen.id {
+                await managedModels.select(chosen, for: .llm)
+            }
+            if previousEngine != .managed {
+                settings.llm = .managed
+            } else if previousModelID != chosen.id {
+                objectWillChange.send()
+            }
+            if announce {
+                presetNotice = "코치·요약·키워드 LLM을 자체 로컬 모델(\(chosen.name))로 전환했습니다."
+            }
+            Task { [weak self] in
+                _ = try? await self?.managedModels.ensureReady(.llm)
+            }
+            return
+        }
+        guard previousEngine != engine else { return }
+        settings.llm = engine
+        if announce {
+            presetNotice = "코치·요약·키워드 LLM을 \(activeLLMModelLabel)(으)로 전환했습니다."
+        }
+    }
+
+    func applySpeedQualityTier(_ tier: SpeedQualityTier) async {
+        await applySTTTier(tier, announce: false)
+        await applyTranslationTier(tier, announce: false)
+        presetNotice = "[\(tier.shortBadge)] 적용 완료 · STT: \(activeSTTModelLabel) · 번역: \(activeTranslationModelLabel)"
+    }
+
+    func applySTTTier(_ tier: SpeedQualityTier, announce: Bool = true) async {
+        sttTier = tier
+        let targetLang = isAutoDetectLanguage ? LanguageCatalog.autoCode : language
+        let appleLocale = isAutoDetectLanguage ? lastFixedLanguage : language
+        let plan = tier.resolveSTTPlan(
+            languageCode: targetLang,
+            installedWhisperIDs: managedModels.installed,
+            parakeetReady: parakeetModels.isCachedOnDisk || parakeetModels.isLoaded,
+            appleModernReady: appleSpeechAssets.isInstalled(for: appleLocale)
+        )
+        let whisperTuningChanged = managedModels.whisperAudioContext != plan.audioContext
+            || managedModels.whisperBestOf != plan.bestOf
+        managedModels.whisperAudioContext = plan.audioContext
+        managedModels.whisperBestOf = plan.bestOf
+
+        let prevEngine = settings.stt
+        let prevModel = managedModels.selectedSTT
+        await switchSTTEngine(plan.engine, managedModelID: plan.managedModelID)
+        if plan.engine == .managed && prevEngine == .managed && prevModel == managedModels.selectedSTT && whisperTuningChanged {
+            if listening {
+                scheduleLiveCaptureRestart(notice: "STT [\(tier.shortBadge)] 속도·스트리밍 설정으로 재연결합니다.")
+            } else {
+                await managedModels.stop(.stt)
+            }
+        }
+        if announce {
+            presetNotice = "STT [\(tier.shortBadge)] 적용 · \(activeSTTModelLabel) (\(plan.reason))"
+        }
+    }
+
+    func applyTranslationTier(_ tier: SpeedQualityTier, announce: Bool = true) async {
+        translationTier = tier
+        let plan = tier.resolveTranslationPlan(installedTranslationIDs: managedModels.installed)
+        await switchTranslationEngine(plan.engine, managedModelID: plan.managedModelID)
+        if announce {
+            presetNotice = "번역 [\(tier.shortBadge)] 적용 · \(activeTranslationModelLabel)"
         }
     }
 
@@ -353,10 +587,13 @@ final class AppModel: ObservableObject {
         }
     }
     @Published var summarizing = false
+    @Published var summarizingWindow: RecentSummaryWindow? = nil
     @Published var summaryError: String?
+    @Published var recentSummaryNotice: String?
     var summaryTask: Task<Void, Never>?
     var summaryDebounce: Task<Void, Never>?
     var summaryToken = UUID()
+    var recentSummaryToken = UUID()
     @Published var organizingScript = false
     @Published var scriptError: String?
     var scriptToken = UUID()
@@ -380,7 +617,17 @@ final class AppModel: ObservableObject {
     @Published var lastFixedLanguage = UserDefaults.standard.string(forKey: "lastFixedRecognitionLanguage") ?? "en-US" {
         didSet { UserDefaults.standard.set(lastFixedLanguage, forKey: "lastFixedRecognitionLanguage") }
     }
+    @Published var autoLanguagePrefs = AutoLanguagePreferences.load() {
+        didSet {
+            autoLanguagePrefs.save()
+            let allowLock = autoLanguagePrefs.mode == .singleLanguageFast
+            managedMic.setAllowWarmLanguageLock(allowLock)
+            managedSystem.setAllowWarmLanguageLock(allowLock)
+        }
+    }
     @Published var detectedSTTLanguage: SupportedLanguage?
+    @Published var detectedLanguageConfidence: Double?
+    @Published var recentDetectedLanguages: [SupportedLanguage] = []
     var isAutoDetectLanguage: Bool { language == LanguageCatalog.autoCode }
     var canUseAutoDetectSTT: Bool {
         if settings.stt != .apple { return true }
@@ -391,12 +638,42 @@ final class AppModel: ObservableObject {
     }
     var sttLanguageBadge: String {
         if isAutoDetectLanguage {
+            let candidatesSuffix = autoLanguagePrefs.preferredCodes.isEmpty ? "" : " (\(autoLanguagePrefs.shortSummary))"
+            if recentDetectedLanguages.count >= 2 {
+                let topTwo = recentDetectedLanguages.prefix(2).map { $0.shortCode.uppercased() }.joined(separator: "/")
+                return "\(t("stt.mode.auto")) · \(topTwo)"
+            }
             if let detected = detectedSTTLanguage {
                 return "\(t("stt.mode.auto")) · \(detected.displayName(in: uiLanguage))"
             }
-            return t("stt.mode.auto")
+            return t("stt.mode.auto") + candidatesSuffix
         }
         return languageName
+    }
+
+    func recordDetectedLanguage(_ result: LanguageDetectionResult) {
+        let preferred = autoLanguagePrefs.preferredCodes
+        if !preferred.isEmpty && !preferred.contains(result.language.code) {
+            // If user set explicit candidate languages, only accept out-of-set detections when script confidence is unmistakable.
+            guard result.source == .script && result.confidence >= 0.92 else { return }
+        }
+        if detectedSTTLanguage?.code != result.language.code {
+            detectedSTTLanguage = result.language
+        }
+        detectedLanguageConfidence = result.confidence
+        recentDetectedLanguages.removeAll { $0.code == result.language.code }
+        recentDetectedLanguages.insert(result.language, at: 0)
+        if recentDetectedLanguages.count > 5 {
+            recentDetectedLanguages = Array(recentDetectedLanguages.prefix(5))
+        }
+    }
+
+    func applyAutoLanguagePreset(_ codes: [String], notice: String) {
+        autoLanguagePrefs.preferredCodes = codes
+        if !isAutoDetectLanguage {
+            selectSTTLanguage(LanguageCatalog.autoCode)
+        }
+        presetNotice = notice
     }
     func setAutoDetectSTT(_ enabled: Bool) {
         if enabled {
@@ -560,11 +837,27 @@ final class AppModel: ObservableObject {
     @Published var replayTarget: Conversation?
     @Published var presetNotice: String?
 
+    @Published private(set) var cachedModelStatus: String? = nil
     var current: Conversation? { conversations.first { $0.id == selectedID } }
-    var modelStatus: String? {
-        switch SystemLanguageModel.default.availability {
-        case .available: return nil
-        case .unavailable(let reason): return "기기 내 AI를 사용할 수 없습니다 (\(reason)). 시스템 설정에서 Apple Intelligence를 활성화하고 모델 다운로드를 완료해주세요."
+    var modelStatus: String? { cachedModelStatus }
+
+    func refreshModelStatus() {
+        guard settings.usesAppleLLMForAnyTask else {
+            if cachedModelStatus != nil { cachedModelStatus = nil }
+            return
+        }
+        Task.detached(priority: .utility) {
+            let status: String?
+            switch SystemLanguageModel.default.availability {
+            case .available:
+                status = nil
+            case .unavailable(let reason):
+                status = "기기 내 AI를 사용할 수 없습니다 (\(reason)). 시스템 설정에서 Apple Intelligence를 활성화하고 모델 다운로드를 완료해주세요."
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.cachedModelStatus != status else { return }
+                self.cachedModelStatus = status
+            }
         }
     }
     var captureSummary: String {
@@ -579,38 +872,64 @@ final class AppModel: ObservableObject {
             conversations = try store.load()
         } catch { message = "기록을 읽지 못했습니다: \(error.localizedDescription)" }
         refreshInputDevices()
+        refreshModelStatus()
         selectedID = conversations.first { $0.archivedAt == nil }?.id
         if selectedID == nil { newConversation() } else {
             lastContext = current?.advice.last?.sourceSnapshot ?? (current?.advice.isEmpty == false ? current?.transcript ?? "" : "")
             scheduleTranslation()
         }
+        let initialLang = language
+        pptSlideSync.onSlideChange = { [weak self] slideNumber in
+            guard let self, self.perspective == .presentation else { return }
+            let cards = PresentationNotesParser.parse(self.activePresentation.notesMarkdown)
+            guard !cards.isEmpty else { return }
+            let targetIndex = min(max(0, slideNumber - 1), cards.count - 1)
+            if self.activePresentation.activeCardIndex != targetIndex {
+                self.mutatePresentation { $0.activeCardIndex = targetIndex }
+            }
+        }
+        pptSlideSync.onDeckSnapshot = { [weak self] snapshot, becameSlideShow, deckChanged in
+            guard let self, self.perspective == .presentation else { return }
+            self.handleLinkedPPTDeckEvent(snapshot: snapshot, becameSlideShow: becameSlideShow, deckChanged: deckChanged)
+        }
+        Task { [weak self] in
+            await self?.appleSpeechAssets.refreshStatuses(extraLocale: initialLang)
+        }
     }
 
     func refreshInputDevices() {
         refreshOutputDevices()
-        permissionStatus = AudioPermissions.status
-        systemAudioPermissionGranted = CGPreflightScreenCaptureAccess()
+        let nextPerm = AudioPermissions.status
+        if permissionStatus != nextPerm { permissionStatus = nextPerm }
+        let nextSysPerm = CGPreflightScreenCaptureAccess()
+        if systemAudioPermissionGranted != nextSysPerm { systemAudioPermissionGranted = nextSysPerm }
         do {
-            inputDevices = try AudioInputDevices.list()
-            deviceError = nil
+            let nextInputs = try AudioInputDevices.list()
+            if inputDevices != nextInputs { inputDevices = nextInputs }
             let deviceID = try? AudioInputDevices.resolve(uid: selectedInputUID)
-            activeInputName = inputDevices.first { $0.id == deviceID }?.name ?? "연결된 입력 없음"
-            if !systemAudioOnly && !selectedInputUID.isEmpty && !inputDevices.contains(where: { $0.uid == selectedInputUID }) {
+            let nextInputName = nextInputs.first { $0.id == deviceID }?.name ?? "연결된 입력 없음"
+            if activeInputName != nextInputName { activeInputName = nextInputName }
+            var nextDeviceError: String? = nil
+            if !systemAudioOnly && !selectedInputUID.isEmpty && !nextInputs.contains(where: { $0.uid == selectedInputUID }) {
                 if listening {
                     missingInputDevicePolls += 1
                     // Tolerate a single 3s poll miss during Bluetooth HFP/A2DP profile switches before stopping capture.
                     if missingInputDevicePolls >= 2 {
                         stop()
-                        deviceError = "선택한 입력 디바이스의 연결이 끊겼습니다. 다른 장치를 선택해주세요."
+                        nextDeviceError = "선택한 입력 디바이스의 연결이 끊겼습니다. 다른 장치를 선택해주세요."
                     }
                 } else {
                     missingInputDevicePolls = 0
-                    deviceError = "이전에 선택한 마이크가 연결되어 있지 않습니다. 듣기를 시작하면 시스템 기본 입력으로 자동 전환됩니다."
+                    nextDeviceError = "이전에 선택한 마이크가 연결되어 있지 않습니다. 듣기를 시작하면 시스템 기본 입력으로 자동 전환됩니다."
                 }
             } else {
                 missingInputDevicePolls = 0
             }
-        } catch { deviceError = systemAudioOnly ? nil : error.localizedDescription }
+            if deviceError != nextDeviceError { deviceError = nextDeviceError }
+        } catch {
+            let nextErr = systemAudioOnly ? nil : error.localizedDescription
+            if deviceError != nextErr { deviceError = nextErr }
+        }
     }
     func useDefaultInputDevice() {
         selectedInputUID = ""
@@ -621,12 +940,19 @@ final class AppModel: ObservableObject {
     func refreshOutputDevices() {
         guard !changingOutputDevice else { return }
         do {
-            outputDevices = try AudioOutputDevices.list()
+            let nextOutputs = try AudioOutputDevices.list()
+            if outputDevices != nextOutputs { outputDevices = nextOutputs }
             let current = try AudioOutputDevices.current()
-            let device = outputDevices.first { $0.id == current }
-            selectedOutputUID = device?.uid ?? ""
-            activeOutputName = device?.name ?? "사용 가능한 출력 장치 없음"
-        } catch { outputDeviceError = error.localizedDescription }
+            let device = nextOutputs.first { $0.id == current }
+            let nextUID = device?.uid ?? ""
+            if selectedOutputUID != nextUID { selectedOutputUID = nextUID }
+            let nextName = device?.name ?? "사용 가능한 출력 장치 없음"
+            if activeOutputName != nextName { activeOutputName = nextName }
+            if outputDeviceError != nil { outputDeviceError = nil }
+        } catch {
+            let err = error.localizedDescription
+            if outputDeviceError != err { outputDeviceError = err }
+        }
     }
     func chooseOutputDevice(_ uid: String) {
         guard uid != selectedOutputUID, !changingOutputDevice else { return }
@@ -665,6 +991,7 @@ final class AppModel: ObservableObject {
     }
 
     func newConversation(autoStart: Bool = false) {
+        pausePresentationTimer()
         lastKeywordAttempt = .distantPast
         resumeReading()
         selectedLiveBlockID = nil
@@ -672,8 +999,11 @@ final class AppModel: ObservableObject {
         let item = Conversation()
         conversations.insert(item, at: 0)
         selectedID = item.id
+        liveSTT.clear()
         lastContext = ""
         detectedSTTLanguage = nil
+        detectedLanguageConfidence = nil
+        recentDetectedLanguages = []
         translationPreview = nil
         save()
         if autoStart && autoStartListeningOnNewConversation {
@@ -681,11 +1011,13 @@ final class AppModel: ObservableObject {
         }
     }
     func select(_ id: UUID) {
+        pausePresentationTimer()
         lastKeywordAttempt = .distantPast
         resumeReading()
         selectedLiveBlockID = nil
         stop()
         translationPreview = nil
+        liveSTT.clear()
         selectedID = id
         lastContext = current?.advice.last?.sourceSnapshot ?? (current?.advice.isEmpty == false ? current?.transcript ?? "" : "")
         lastAdviceAttempt = .distantPast
@@ -737,15 +1069,21 @@ final class AppModel: ObservableObject {
 
     func updateText(_ text: String) {
         guard let index = conversations.firstIndex(where: { $0.id == selectedID }), conversations[index].archivedAt == nil else { return }
-        if conversations[index].transcript != text {
-            lastTranscriptChange = Date()
-            if isAutoDetectLanguage, let detected = LanguageCatalog.detectLanguage(for: text) {
-                if detectedSTTLanguage?.code != detected.code { detectedSTTLanguage = detected }
+        let previous = conversations[index].transcript
+        guard previous != text else { return }
+        lastTranscriptChange = Date()
+        if isAutoDetectLanguage {
+            let sampleText = text.count > 240 ? String(text.suffix(240)) : text
+            if let detected = LanguageCatalog.detectLanguageDetailed(for: sampleText, preferredCodes: autoLanguagePrefs.preferredCodes) {
+                recordDetectedLanguage(detected)
             }
         }
-        conversations[index].transcriptSpans = RecentActivity.update(old: conversations[index].transcript, new: text,
+        conversations[index].transcriptSpans = RecentActivity.update(old: previous, new: text,
                                                                       spans: conversations[index].transcriptSpans ?? [], at: Date())
         conversations[index].transcript = text
+        if conversations[index].presentation != nil {
+            syncPresentationChecklist(with: text, at: index)
+        }
         if followLive, let selectedLiveBlockID, !(conversations[index].transcriptSpans ?? []).contains(where: { $0.id == selectedLiveBlockID }) { self.selectedLiveBlockID = nil }
         if conversations[index].title == "새 대화", text.count > 5 { conversations[index].title = String(text.prefix(24)) }
         scheduleSave()

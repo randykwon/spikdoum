@@ -64,6 +64,80 @@ struct SupportedLanguage: Identifiable, Equatable, Hashable, Sendable {
     }
 }
 
+enum AutoLanguageMode: String, CaseIterable, Codable, Identifiable, Sendable {
+    /// Allows speakers to freely switch languages sentence-by-sentence (English ↔ Korean ↔ Japanese ↔ etc.).
+    case multilingualSwitch
+    /// Locks Whisper onto the detected language after 2 matching utterances for maximum monolingual speed.
+    case singleLanguageFast
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .multilingualSwitch: return "다국어 자유 전환 (권장)"
+        case .singleLanguageFast: return "단일 언어 빠른 잠금"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .multilingualSwitch: return "한 대화에서 여러 언어가 섞여 나와도 문장마다 자동 전환"
+        case .singleLanguageFast: return "주 언어가 확인되면 고정해 추론 속도를 높임"
+        }
+    }
+}
+
+struct AutoLanguagePreferences: Codable, Equatable, Sendable {
+    static let storageKey = "autoLanguagePreferencesV1"
+
+    var mode: AutoLanguageMode = .multilingualSwitch
+    /// Optional BCP-47 candidate language codes (e.g. ["en-US", "ko-KR", "ja-JP"]).
+    /// Empty means unrestricted (all supported languages allowed).
+    var preferredCodes: [String] = []
+
+    mutating func toggleCandidate(_ code: String) {
+        guard LanguageCatalog.language(for: code) != nil else { return }
+        if let idx = preferredCodes.firstIndex(of: code) {
+            preferredCodes.remove(at: idx)
+        } else {
+            preferredCodes.append(code)
+        }
+    }
+
+    var shortSummary: String {
+        guard !preferredCodes.isEmpty else { return "전체 언어" }
+        return preferredCodes
+            .compactMap { LanguageCatalog.language(for: $0)?.shortCode.uppercased() }
+            .joined(separator: "·")
+    }
+
+    static func load(defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: storageKey),
+              let decoded = try? JSONDecoder().decode(Self.self, from: data) else {
+            return Self()
+        }
+        return decoded
+    }
+
+    func save(defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(self) {
+            defaults.set(data, forKey: Self.storageKey)
+        }
+    }
+}
+
+struct LanguageDetectionResult: Equatable, Sendable {
+    enum Source: String, Equatable, Sendable {
+        case whisperAcoustic
+        case script
+        case nlRecognizer
+    }
+
+    let language: SupportedLanguage
+    let confidence: Double
+    let source: Source
+}
+
 enum LanguageCatalog {
     static let autoCode = "auto"
 
@@ -79,11 +153,45 @@ enum LanguageCatalog {
         SupportedLanguage(code: "pt-BR", shortCode: "pt", azureCode: "pt", translationCode: "pt", englishName: "Portuguese", nativeName: "Português", koName: "포르투갈어", jaName: "ポルトガル語", zhName: "葡萄牙语"),
         SupportedLanguage(code: "it-IT", shortCode: "it", azureCode: "it", translationCode: "it", englishName: "Italian", nativeName: "Italiano", koName: "이탈리아어", jaName: "イタリア語", zhName: "意大利语"),
         SupportedLanguage(code: "ru-RU", shortCode: "ru", azureCode: "ru", translationCode: "ru", englishName: "Russian", nativeName: "Русский", koName: "러시아어", jaName: "ロシア語", zhName: "俄语"),
-        SupportedLanguage(code: "vi-VN", shortCode: "vi", azureCode: "vi", translationCode: "vi", englishName: "Vietnamese", nativeName: "Tiếng Việt", koName: "베트남어", jaName: "ベトナム語", zhName: "越南语")
+        SupportedLanguage(code: "vi-VN", shortCode: "vi", azureCode: "vi", translationCode: "vi", englishName: "Vietnamese", nativeName: "Tiếng Việt", koName: "베트남어", jaName: "ベトナム語", zhName: "越南语"),
+        SupportedLanguage(code: "th-TH", shortCode: "th", azureCode: "th", translationCode: "th", englishName: "Thai", nativeName: "ไทย", koName: "태국어", jaName: "タイ語", zhName: "泰语"),
+        SupportedLanguage(code: "id-ID", shortCode: "id", azureCode: "id", translationCode: "id", englishName: "Indonesian", nativeName: "Bahasa Indonesia", koName: "인도네시아어", jaName: "インドネシア語", zhName: "印尼语"),
+        SupportedLanguage(code: "hi-IN", shortCode: "hi", azureCode: "hi", translationCode: "hi", englishName: "Hindi", nativeName: "हिन्दी", koName: "힌디어", jaName: "ヒンディー語", zhName: "印地语"),
+        SupportedLanguage(code: "ar-SA", shortCode: "ar", azureCode: "ar", translationCode: "ar", englishName: "Arabic", nativeName: "العربية", koName: "아랍어", jaName: "アラビア語", zhName: "阿拉伯语"),
+        SupportedLanguage(code: "nl-NL", shortCode: "nl", azureCode: "nl", translationCode: "nl", englishName: "Dutch", nativeName: "Nederlands", koName: "네덜란드어", jaName: "オランダ語", zhName: "荷兰语"),
+        SupportedLanguage(code: "tr-TR", shortCode: "tr", azureCode: "tr", translationCode: "tr", englishName: "Turkish", nativeName: "Türkçe", koName: "튀르키예어", jaName: "トルコ語", zhName: "土耳其语")
     ]
 
     static func language(for code: String) -> SupportedLanguage? {
         all.first { $0.code == code || $0.shortCode == code || $0.translationCode == code }
+    }
+
+    /// Maps Whisper `verbose_json` language identifiers (e.g. `"japanese"`, `"ja"`, `"korean"`, `"chinese"`, `"english"`)
+    /// to a supported language entry.
+    static func language(forWhisperName raw: String) -> SupportedLanguage? {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty, key != "auto" else { return nil }
+        if let direct = language(for: key) { return direct }
+        switch key {
+        case "english": return language(for: "en-US")
+        case "korean": return language(for: "ko-KR")
+        case "japanese": return language(for: "ja-JP")
+        case "chinese", "mandarin", "cantonese": return language(for: "zh-CN")
+        case "spanish": return language(for: "es-ES")
+        case "french": return language(for: "fr-FR")
+        case "german": return language(for: "de-DE")
+        case "portuguese": return language(for: "pt-BR")
+        case "italian": return language(for: "it-IT")
+        case "russian": return language(for: "ru-RU")
+        case "vietnamese": return language(for: "vi-VN")
+        case "thai": return language(for: "th-TH")
+        case "indonesian": return language(for: "id-ID")
+        case "hindi": return language(for: "hi-IN")
+        case "arabic": return language(for: "ar-SA")
+        case "dutch": return language(for: "nl-NL")
+        case "turkish": return language(for: "tr-TR")
+        default: return nil
+        }
     }
 
     static func whisperLanguageParameter(for code: String) -> String {
@@ -96,9 +204,62 @@ enum LanguageCatalog {
         return language(for: code)?.displayName(in: ui) ?? code
     }
 
+    static func nlLanguage(for code: String) -> NLLanguage? {
+        switch code {
+        case "en-US", "en": return .english
+        case "ko-KR", "ko": return .korean
+        case "ja-JP", "ja": return .japanese
+        case "zh-CN", "zh-Hans": return .simplifiedChinese
+        case "zh-TW", "zh-Hant": return .traditionalChinese
+        case "es-ES", "es": return .spanish
+        case "fr-FR", "fr": return .french
+        case "de-DE", "de": return .german
+        case "pt-BR", "pt": return .portuguese
+        case "it-IT", "it": return .italian
+        case "ru-RU", "ru": return .russian
+        case "vi-VN", "vi": return .vietnamese
+        case "th-TH", "th": return .thai
+        case "id-ID", "id": return .indonesian
+        case "hi-IN", "hi": return .hindi
+        case "ar-SA", "ar": return .arabic
+        case "nl-NL", "nl": return .dutch
+        case "tr-TR", "tr": return .turkish
+        default: return nil
+        }
+    }
+
+    static func supportedLanguage(for nl: NLLanguage) -> SupportedLanguage? {
+        switch nl {
+        case .english: return language(for: "en-US")
+        case .korean: return language(for: "ko-KR")
+        case .japanese: return language(for: "ja-JP")
+        case .simplifiedChinese: return language(for: "zh-CN")
+        case .traditionalChinese: return language(for: "zh-TW")
+        case .spanish: return language(for: "es-ES")
+        case .french: return language(for: "fr-FR")
+        case .german: return language(for: "de-DE")
+        case .portuguese: return language(for: "pt-BR")
+        case .italian: return language(for: "it-IT")
+        case .russian: return language(for: "ru-RU")
+        case .vietnamese: return language(for: "vi-VN")
+        case .thai: return language(for: "th-TH")
+        case .indonesian: return language(for: "id-ID")
+        case .hindi: return language(for: "hi-IN")
+        case .arabic: return language(for: "ar-SA")
+        case .dutch: return language(for: "nl-NL")
+        case .turkish: return language(for: "tr-TR")
+        default: return nil
+        }
+    }
+
     /// Detects the spoken language of a transcript snippet while ignoring bracketed source labels
-    /// such as `[마이크]` or `[Mac 재생음]` that would otherwise bias language recognition.
-    static func detectLanguage(for text: String) -> SupportedLanguage? {
+    /// such as `[마이크]` or `[Mac 재생음]`. Uses script-first heuristics for short & code-switched
+    /// CJK/non-Latin utterances before falling back to constrained `NLLanguageRecognizer`.
+    static func detectLanguage(for text: String, preferredCodes: [String] = []) -> SupportedLanguage? {
+        detectLanguageDetailed(for: text, preferredCodes: preferredCodes)?.language
+    }
+
+    static func detectLanguageDetailed(for text: String, preferredCodes: [String] = []) -> LanguageDetectionResult? {
         let strippedLines = text
             .components(separatedBy: .newlines)
             .map { line -> String in
@@ -110,27 +271,72 @@ enum LanguageCatalog {
             }
             .filter { !$0.isEmpty }
         let sample = strippedLines.suffix(3).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sample.isEmpty else { return nil }
+
+        // 1. Script-first detection handles 2-char CJK/non-Latin phrases & code-switching (e.g. "API 에러", "Q3 レビュー").
+        var hangul = 0, kana = 0, han = 0, thai = 0, arabic = 0, devanagari = 0, cyrillic = 0, letters = 0
+        for scalar in sample.unicodeScalars {
+            let v = scalar.value
+            if CharacterSet.letters.contains(scalar) { letters += 1 }
+            if (0xAC00...0xD7A3).contains(v) || (0x1100...0x11FF).contains(v) || (0x3130...0x318F).contains(v) { hangul += 1 }
+            else if (0x3040...0x30FF).contains(v) { kana += 1 }
+            else if (0x4E00...0x9FFF).contains(v) { han += 1 }
+            else if (0x0E00...0x0E7F).contains(v) { thai += 1 }
+            else if (0x0600...0x06FF).contains(v) { arabic += 1 }
+            else if (0x0900...0x097F).contains(v) { devanagari += 1 }
+            else if (0x0400...0x04FF).contains(v) { cyrillic += 1 }
+        }
+
+        if kana >= 1 && kana >= hangul, let ja = language(for: "ja-JP") {
+            return LanguageDetectionResult(language: ja, confidence: 0.96, source: .script)
+        }
+        if hangul >= 2 || (hangul >= 1 && letters > 0 && Double(hangul) / Double(letters) >= 0.3), let ko = language(for: "ko-KR") {
+            return LanguageDetectionResult(language: ko, confidence: 0.96, source: .script)
+        }
+        if thai >= 2, let th = language(for: "th-TH") {
+            return LanguageDetectionResult(language: th, confidence: 0.96, source: .script)
+        }
+        if arabic >= 2, let ar = language(for: "ar-SA") {
+            return LanguageDetectionResult(language: ar, confidence: 0.96, source: .script)
+        }
+        if devanagari >= 2, let hi = language(for: "hi-IN") {
+            return LanguageDetectionResult(language: hi, confidence: 0.96, source: .script)
+        }
+        if cyrillic >= 2, let ru = language(for: "ru-RU") {
+            return LanguageDetectionResult(language: ru, confidence: 0.95, source: .script)
+        }
+        if han >= 2 && hangul == 0 && kana == 0 {
+            let prefersJA = preferredCodes.contains("ja-JP") && !preferredCodes.contains("zh-CN") && !preferredCodes.contains("zh-TW")
+            if prefersJA, let ja = language(for: "ja-JP") {
+                return LanguageDetectionResult(language: ja, confidence: 0.85, source: .script)
+            }
+            let recognizer = NLLanguageRecognizer()
+            recognizer.languageConstraints = [.simplifiedChinese, .traditionalChinese, .japanese]
+            recognizer.processString(sample)
+            if let top = recognizer.dominantLanguage, let spec = supportedLanguage(for: top) {
+                let conf = recognizer.languageHypotheses(withMaximum: 3)[top] ?? 0.85
+                return LanguageDetectionResult(language: spec, confidence: max(0.75, conf), source: .nlRecognizer)
+            }
+            if let zh = language(for: "zh-CN") {
+                return LanguageDetectionResult(language: zh, confidence: 0.80, source: .script)
+            }
+        }
+
+        // 2. Latin-script phrases need >= 4 chars so tiny interjections like "ok" do not trigger noisy flips.
         guard sample.count >= 4 else { return nil }
         let recognizer = NLLanguageRecognizer()
-        recognizer.processString(sample)
-        guard let dominant = recognizer.dominantLanguage else { return nil }
-        let code: String?
-        switch dominant {
-        case .english: code = "en-US"
-        case .korean: code = "ko-KR"
-        case .japanese: code = "ja-JP"
-        case .simplifiedChinese: code = "zh-CN"
-        case .traditionalChinese: code = "zh-TW"
-        case .spanish: code = "es-ES"
-        case .french: code = "fr-FR"
-        case .german: code = "de-DE"
-        case .portuguese: code = "pt-BR"
-        case .italian: code = "it-IT"
-        case .russian: code = "ru-RU"
-        case .vietnamese: code = "vi-VN"
-        default: code = nil
+        let constraints = preferredCodes.compactMap { nlLanguage(for: $0) }
+        if !constraints.isEmpty {
+            recognizer.languageConstraints = constraints
         }
-        return code.flatMap { language(for: $0) }
+        recognizer.processString(sample)
+        let hypotheses = recognizer.languageHypotheses(withMaximum: 3)
+        guard let dominant = recognizer.dominantLanguage,
+              let spec = supportedLanguage(for: dominant) else { return nil }
+        let confidence = hypotheses[dominant] ?? 0
+        let minConfidence = constraints.isEmpty ? 0.35 : 0.25
+        guard confidence >= minConfidence else { return nil }
+        return LanguageDetectionResult(language: spec, confidence: confidence, source: .nlRecognizer)
     }
 
     /// Verifies that generated text (e.g., a summary) is actually written in the expected language.

@@ -47,12 +47,128 @@ private enum LinkedSpeakerFilter: String, CaseIterable {
     case system = "Mac 소리"
 }
 
+/// Ultra-lightweight live streaming caption row that observes ONLY `LiveSTTDisplayStore`.
+/// Re-renders in <0.2ms on every partial word without invalidating `ContentView` or `ConversationBlocks`.
+struct LiveSTTCaptionRow: View {
+    @ObservedObject var liveSTT: LiveSTTDisplayStore
+    let appearance: STTAppearance
+    let followLive: Bool
+    var showSourceBadge: Bool = true
+    var sideBySideWidths: (stt: CGFloat, translation: CGFloat, coach: CGFloat)? = nil
+    var showTranslationColumn: Bool = false
+    var showCoachColumn: Bool = false
+    var compact: Bool = false
+    var onTextChange: (() -> Void)? = nil
+
+    var body: some View {
+        Group {
+            if followLive && !liveSTT.text.isEmpty {
+                let isMic = liveSTT.sourceTag == "마이크"
+                let accent: Color = isMic ? .teal : .blue
+                let innerPad: CGFloat = compact ? 7 : 10
+                VStack(alignment: .leading, spacing: compact ? 4 : 6) {
+                    HStack(spacing: 6) {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.white)
+                                .frame(width: 5, height: 5)
+                            Text("실시간 인식 중")
+                                .font(.system(size: 9, weight: .bold))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .foregroundStyle(Color.white)
+                        .background(accent, in: Capsule())
+
+                        if showSourceBadge, let tag = liveSTT.sourceTag {
+                            Label(tag == "마이크" ? "내 목소리" : "Mac 소리", systemImage: isMic ? "mic.fill" : "speaker.wave.2.fill")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .foregroundStyle(accent)
+                                .background(accent.opacity(0.14), in: Capsule())
+                        }
+                        Spacer(minLength: 4)
+                    }
+
+                    if let widths = sideBySideWidths {
+                        HStack(alignment: .top, spacing: 10) {
+                            Text(liveSTT.text)
+                                .font(.system(size: appearance.latestFontSize, weight: .semibold))
+                                .foregroundStyle(appearance.latestText.color)
+                                .lineSpacing(compact ? 2 : (appearance.fontSize <= 13 ? 3 : 5))
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(innerPad)
+                                .frame(width: widths.stt, alignment: .topLeading)
+                                .background(appearance.latestBackground.color.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
+
+                            if showTranslationColumn && widths.translation > 0 {
+                                HStack(spacing: 5) {
+                                    ProgressView().controlSize(.mini)
+                                    Text("발화 완료 시 즉시 번역…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(innerPad)
+                                .frame(width: widths.translation, alignment: .topLeading)
+                                .background((isMic ? Color.teal : Color.purple).opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            if showCoachColumn && widths.coach > 0 {
+                                Text("—")
+                                    .font(.caption)
+                                    .foregroundStyle(.quaternary)
+                                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                                    .padding(innerPad)
+                                    .frame(width: widths.coach, alignment: .topLeading)
+                                    .background(Color.secondary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
+                            }
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(liveSTT.text)
+                            .font(.system(size: appearance.latestFontSize, weight: .semibold))
+                            .foregroundStyle(appearance.latestText.color)
+                            .lineSpacing(compact ? 2 : (appearance.fontSize <= 13 ? 3 : 5))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, innerPad)
+                            .padding(.vertical, compact ? 5 : 8)
+                            .background(appearance.latestBackground.color.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(compact ? 7 : 10)
+                .background(accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 11))
+                .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(accent.opacity(0.65), style: StrokeStyle(lineWidth: 1.4, dash: [5, 3])))
+            }
+        }
+        .onChange(of: liveSTT.text) { _, next in
+            if followLive && !next.isEmpty {
+                onTextChange?()
+            }
+        }
+    }
+}
+
+private struct EmptyStateUnlessLive<Content: View>: View {
+    @ObservedObject var liveSTT: LiveSTTDisplayStore
+    @ViewBuilder let content: () -> Content
+    var body: some View {
+        if liveSTT.text.isEmpty {
+            content()
+        }
+    }
+}
+
 struct LinkedConversationView: View {
     @ObservedObject var model: AppModel
     @AppStorage("linkedRowStyle") private var rowStyleRaw = LinkedRowStyle.sideBySide.rawValue
     @AppStorage("linkedColumnBalance") private var columnBalanceRaw = LinkedColumnBalance.translationWide.rawValue
     @AppStorage("linkedNewestFirst") private var newestFirst = false
     @AppStorage("linkedCompactDensity") private var compactDensity = false
+    @AppStorage("pinLatestSpotlight") private var pinLatestSpotlight = true
+    @AppStorage("pinnedSpotlightCount") private var pinnedSpotlightCount = 1
+    @AppStorage("linkedControlHeaderCollapsedV1") private var controlHeaderCollapsed = false
     @State private var showHistory = false
     @State private var showingAppearance = false
     @State private var speakerFilter: LinkedSpeakerFilter = .all
@@ -86,14 +202,30 @@ struct LinkedConversationView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            controlHeader
+        VStack(alignment: .leading, spacing: (model.topHeaderCollapsed || controlHeaderCollapsed) ? 4 : 6) {
+            if !model.topHeaderCollapsed {
+                if controlHeaderCollapsed {
+                    HStack(spacing: 6) {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.16)) { controlHeaderCollapsed = false }
+                        } label: {
+                            Label("보기 옵션 펼치기", systemImage: "chevron.down")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.10), in: Capsule())
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("좌우/상하 배치 · 최근 고정 · 검색 바 펼치기")
+                        Spacer()
+                        if model.translating { ProgressView().controlSize(.mini) }
+                    }
+                } else {
+                    controlHeader
+                }
+            }
             if showingSearch {
                 searchBar
-            }
-            if !model.simpleFastMode && model.showTranslationKeywords {
-                TranslationKeywordsView(model: model)
-                    .frame(maxWidth: .infinity)
             }
             GeometryReader { geo in
                 let widths = columnWidths(totalWidth: max(320, geo.size.width - 28))
@@ -183,17 +315,45 @@ struct LinkedConversationView: View {
             }
 
             Button {
-                withAnimation(.easeInOut(duration: 0.15)) { newestFirst.toggle() }
+                withAnimation(.easeInOut(duration: 0.15)) { pinLatestSpotlight.toggle() }
             } label: {
-                Label(newestFirst ? "최신 위" : "시간순", systemImage: newestFirst ? "arrow.up.circle" : "arrow.down.circle")
-                    .font(.caption2.weight(.medium))
+                Label("최근 고정", systemImage: pinLatestSpotlight ? "pin.fill" : "pin")
+                    .font(.caption2.weight(.semibold))
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .background(newestFirst ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08), in: Capsule())
-                    .foregroundStyle(newestFirst ? Color.accentColor : Color.secondary)
+                    .background(pinLatestSpotlight ? Color.accentColor.opacity(0.16) : Color.secondary.opacity(0.08), in: Capsule())
+                    .foregroundStyle(pinLatestSpotlight ? Color.accentColor : Color.secondary)
             }
             .buttonStyle(.plain)
-            .help(newestFirst ? "최신 문장이 맨 위에 표시됩니다" : "시간순으로 아래에 쌓입니다")
+            .help(pinLatestSpotlight ? "최근 원문·번역을 상단에 고정해 스크롤 없이 편안하게 봅니다 (클릭하여 해제)" : "최근 원문·번역을 상단에 고정해 스크롤 없이 보기")
+
+            if pinLatestSpotlight {
+                Button {
+                    pinnedSpotlightCount = pinnedSpotlightCount == 1 ? 2 : 1
+                } label: {
+                    Text("\(pinnedSpotlightCount)문장")
+                        .font(.caption2.monospacedDigit().weight(.medium))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.10), in: Capsule())
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("상단 고정 영역에 표시할 최근 문장 수 전환 (1문장 / 2문장)")
+            } else {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { newestFirst.toggle() }
+                } label: {
+                    Label(newestFirst ? "최신 위" : "시간순", systemImage: newestFirst ? "arrow.up.circle" : "arrow.down.circle")
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(newestFirst ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08), in: Capsule())
+                        .foregroundStyle(newestFirst ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(newestFirst ? "최신 문장이 맨 위에 표시됩니다" : "시간순으로 아래에 쌓입니다")
+            }
 
             Button {
                 withAnimation(.easeInOut(duration: 0.15)) { compactDensity.toggle() }
@@ -283,6 +443,17 @@ struct LinkedConversationView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("연계 보기 표시 및 번역·코치 설정")
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) { controlHeaderCollapsed = true }
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+            }
+            .buttonStyle(.plain)
+            .help("보기 옵션 바 접기")
         }
         .controlSize(.small)
     }
@@ -414,7 +585,11 @@ struct LinkedConversationView: View {
                     }
                     return true
                 }
-                let orderedBlocks = newestFirst ? Array(filteredBlocks.reversed()) : filteredBlocks
+                let usePinnedStage = pinLatestSpotlight && trimmedQuery.isEmpty
+                let pinCount = max(1, min(2, pinnedSpotlightCount))
+                let pinnedBlocks = usePinnedStage ? Array(filteredBlocks.suffix(pinCount).reversed()) : []
+                let historySource = usePinnedStage ? Array(filteredBlocks.dropLast(pinnedBlocks.count)) : filteredBlocks
+                let orderedBlocks = (usePinnedStage || newestFirst) ? Array(historySource.reversed()) : historySource
                 let latestBlockID = allBlocks.last?.id
                 let linkedAdviceIDs = Set(allBlocks.flatMap { $0.advice.map(\.id) })
                 let unlinkedAdvice = conversation.advice.filter { !linkedAdviceIDs.contains($0.id) && (showAll || $0.date >= cutoff) }
@@ -425,66 +600,180 @@ struct LinkedConversationView: View {
                 let anchorID = newestFirst ? "linked-top" : "linked-bottom"
                 let anchorPos: UnitPoint = newestFirst ? .top : .bottom
 
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: compactDensity ? 5 : 8) {
-                            Color.clear.frame(height: 1).id("linked-top")
-                            if newestFirst && showSeparatePending {
-                                pendingBanner
+                VStack(alignment: .leading, spacing: 8) {
+                    if usePinnedStage {
+                        // FIXED NON-SCROLLING RECENT STAGE: eyes stay locked on one calm spot without scroll jumping.
+                        VStack(alignment: .leading, spacing: compactDensity ? 5 : 7) {
+                            HStack(spacing: 6) {
+                                Label("최근 내용 고정", systemImage: "pin.fill")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(Color.accentColor)
+                                Text("스크롤 없이 이 자리에 실시간 갱신")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if !orderedBlocks.isEmpty {
+                                    Text("아래 이전 기록 \(orderedBlocks.count)건")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
                             }
-                            if orderedBlocks.isEmpty {
-                                ContentUnavailableView(
-                                    !trimmedQuery.isEmpty ? "검색 결과가 없습니다" : conversation.transcript.isEmpty ? "대화를 시작해 주세요" : "표시할 발언이 없습니다",
-                                    systemImage: !trimmedQuery.isEmpty ? "magnifyingglass" : "waveform",
-                                    description: Text(!trimmedQuery.isEmpty ? "다른 검색어를 입력하거나 검색을 지워보세요." : "원문과 번역을 한 문장씩 연결해 보여줍니다.")
+                            .padding(.horizontal, 4)
+
+                            if effectiveShowSTT {
+                                LiveSTTCaptionRow(
+                                    liveSTT: model.liveSTT,
+                                    appearance: model.sttAppearance,
+                                    followLive: model.followLive,
+                                    sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
+                                    showTranslationColumn: effectiveShowTranslation,
+                                    showCoachColumn: effectiveShowCoach,
+                                    compact: compactDensity
                                 )
-                                .padding(.vertical, 24)
                             }
-                            ForEach(orderedBlocks) { block in
-                                let isLatest = block.id == latestBlockID
-                                linkedRow(
-                                    block,
-                                    conversation: conversation,
-                                    latest: isLatest,
-                                    inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
-                                    widths: widths
-                                )
-                                .id(block.id)
-                            }
-                            if effectiveShowCoach && !unlinkedAdvice.isEmpty && trimmedQuery.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("추가 조언 기록 (\(unlinkedAdvice.count))").font(.caption.bold()).foregroundStyle(.secondary)
-                                    ForEach(unlinkedAdvice) { item in
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(item.date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
-                                            AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
-                                        }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                                            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+
+                            if pinnedBlocks.isEmpty {
+                                EmptyStateUnlessLive(liveSTT: model.liveSTT) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "waveform")
+                                            .foregroundStyle(.secondary)
+                                        Text(conversation.transcript.isEmpty ? "대화를 시작하면 최근 원문과 번역이 스크롤 없이 여기에 고정 표시됩니다." : "표시할 최근 발언이 없습니다.")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
-                                }.padding(.top, 4)
+                                    .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                                }
+                            } else {
+                                ForEach(pinnedBlocks) { block in
+                                    let isLatest = block.id == latestBlockID
+                                    linkedRow(
+                                        block,
+                                        conversation: conversation,
+                                        latest: isLatest,
+                                        inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
+                                        widths: widths
+                                    )
+                                }
                             }
-                            if !newestFirst && showSeparatePending {
+
+                            if showSeparatePending {
                                 pendingBanner
                             }
-                            Color.clear.frame(height: 1).id("linked-bottom")
                         }
+                        .padding(8)
+                        .background(Color.accentColor.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.accentColor.opacity(0.22), lineWidth: 1))
                         .padding(.horizontal, 2)
-                        .padding(.vertical, 2)
-                    }
-                    .readingScrollControl(model)
-                    .onAppear { if model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
-                    .onChange(of: model.displayConversation?.transcript) { _, _ in if model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
-                    .onChange(of: model.displayConversation?.translations?.count) { _, _ in if model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
-                    .onChange(of: model.displayConversation?.advice.count) { _, _ in if model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
-                    .onChange(of: model.selectedConversationBlockID) { _, id in if let id { proxy.scrollTo(id, anchor: .center) } }
-                    .onChange(of: model.selectedLiveBlockID) { _, id in
-                        if model.selectedConversationBlockID == nil, let id, let block = orderedBlocks.last(where: { $0.spans.contains { $0.id == id } }) {
-                            proxy.scrollTo(block.id, anchor: .center)
+
+                        if !orderedBlocks.isEmpty || (effectiveShowCoach && !unlinkedAdvice.isEmpty) {
+                            HStack(spacing: 6) {
+                                Text("이전 대화 기록")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.secondary)
+                                Text("(\(orderedBlocks.count)건 · 스크롤 고정)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.16))
+                                    .frame(height: 1)
+                            }
+                            .padding(.horizontal, 6)
                         }
                     }
-                    .onChange(of: model.followLive) { _, follow in if follow { proxy.scrollTo(anchorID, anchor: anchorPos) } }
-                    .onChange(of: model.selectedID) { _, _ in proxy.scrollTo(anchorID, anchor: anchorPos) }
-                    .onChange(of: newestFirst) { _, _ in if model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: compactDensity ? 5 : 8) {
+                                Color.clear.frame(height: 1).id("linked-top")
+                                if !usePinnedStage && newestFirst && effectiveShowSTT {
+                                    LiveSTTCaptionRow(
+                                        liveSTT: model.liveSTT,
+                                        appearance: model.sttAppearance,
+                                        followLive: model.followLive,
+                                        sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
+                                        showTranslationColumn: effectiveShowTranslation,
+                                        showCoachColumn: effectiveShowCoach,
+                                        compact: compactDensity
+                                    ) {
+                                        proxy.scrollTo(anchorID, anchor: anchorPos)
+                                    }
+                                    .id("linked-live-stt")
+                                }
+                                if !usePinnedStage && newestFirst && showSeparatePending {
+                                    pendingBanner
+                                }
+                                if !usePinnedStage && orderedBlocks.isEmpty {
+                                    EmptyStateUnlessLive(liveSTT: model.liveSTT) {
+                                        ContentUnavailableView(
+                                            !trimmedQuery.isEmpty ? "검색 결과가 없습니다" : conversation.transcript.isEmpty ? "대화를 시작해 주세요" : "표시할 발언이 없습니다",
+                                            systemImage: !trimmedQuery.isEmpty ? "magnifyingglass" : "waveform",
+                                            description: Text(!trimmedQuery.isEmpty ? "다른 검색어를 입력하거나 검색을 지워보세요." : "원문과 번역을 한 문장씩 연결해 보여줍니다.")
+                                        )
+                                        .padding(.vertical, 24)
+                                    }
+                                }
+                                ForEach(orderedBlocks) { block in
+                                    let isLatest = !usePinnedStage && block.id == latestBlockID
+                                    linkedRow(
+                                        block,
+                                        conversation: conversation,
+                                        latest: isLatest,
+                                        inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
+                                        widths: widths
+                                    )
+                                    .id(block.id)
+                                }
+                                if effectiveShowCoach && !unlinkedAdvice.isEmpty && trimmedQuery.isEmpty {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("추가 조언 기록 (\(unlinkedAdvice.count))").font(.caption.bold()).foregroundStyle(.secondary)
+                                        ForEach(unlinkedAdvice) { item in
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text(item.date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
+                                                AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
+                                            }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                                                .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                                        }
+                                    }.padding(.top, 4)
+                                }
+                                if !usePinnedStage && !newestFirst && effectiveShowSTT {
+                                    LiveSTTCaptionRow(
+                                        liveSTT: model.liveSTT,
+                                        appearance: model.sttAppearance,
+                                        followLive: model.followLive,
+                                        sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
+                                        showTranslationColumn: effectiveShowTranslation,
+                                        showCoachColumn: effectiveShowCoach,
+                                        compact: compactDensity
+                                    ) {
+                                        proxy.scrollTo(anchorID, anchor: anchorPos)
+                                    }
+                                    .id("linked-live-stt")
+                                }
+                                if !usePinnedStage && !newestFirst && showSeparatePending {
+                                    pendingBanner
+                                }
+                                Color.clear.frame(height: 1).id("linked-bottom")
+                            }
+                            .padding(.horizontal, 2)
+                            .padding(.vertical, 2)
+                        }
+                        .readingScrollControl(model)
+                        .onAppear { if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: model.displayConversation?.transcript) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: model.displayConversation?.translations?.count) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: model.displayConversation?.advice.count) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: model.selectedConversationBlockID) { _, id in if let id { proxy.scrollTo(id, anchor: .center) } }
+                        .onChange(of: model.selectedLiveBlockID) { _, id in
+                            if model.selectedConversationBlockID == nil, let id, let block = orderedBlocks.last(where: { $0.spans.contains { $0.id == id } }) {
+                                proxy.scrollTo(block.id, anchor: .center)
+                            }
+                        }
+                        .onChange(of: model.followLive) { _, follow in if !usePinnedStage && follow { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: model.selectedID) { _, _ in if !usePinnedStage { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                        .onChange(of: newestFirst) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
+                    }
                 }
             }
         }
@@ -524,6 +813,21 @@ struct LinkedConversationView: View {
                     .padding(.vertical, 2)
                     .foregroundStyle(isMic ? Color.teal : Color.blue)
                     .background((isMic ? Color.teal : Color.blue).opacity(0.14), in: Capsule())
+            }
+
+            if let entry = block.translation,
+               let srcCode = entry.sourceLanguageCode,
+               let srcLang = LanguageCatalog.language(for: srcCode) {
+                let dstShort = entry.targetLanguage.flatMap { LanguageCatalog.language(for: $0)?.shortCode } ?? model.targetLanguageSpec.shortCode
+                let badgeText = srcLang.shortCode == dstShort
+                    ? srcLang.shortCode.uppercased()
+                    : "\(srcLang.shortCode.uppercased())→\(dstShort.uppercased())"
+                Text(badgeText)
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .foregroundStyle(Color.purple)
+                    .background(Color.purple.opacity(0.12), in: Capsule())
             }
 
             if latest && model.listening {

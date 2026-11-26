@@ -19,6 +19,7 @@ struct TranslationEntry: Codable, Identifiable {
     var date: Date? = Date()
     var translated: String
     var engine: String? = "apple-translation-v1"
+    var sourceLanguageCode: String? = nil
     var targetLanguage: String? = nil
     var sourceStart: Int? = nil
     var sourceEnd: Int? = nil
@@ -60,6 +61,7 @@ struct Conversation: Codable, Identifiable {
     var summaryHistory: [SummarySnapshot]? = nil
     var audioClips: [AudioClipRecord]? = nil
     var organizedScript: OrganizedScript? = nil
+    var presentation: PresentationSession? = nil
     var allKeywords: [String] {
         KeywordPolicy.merged(current: keywords, history: keywordHistory ?? [])
     }

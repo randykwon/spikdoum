@@ -333,8 +333,20 @@ struct SummaryScriptPanel: View {
                 SummaryPanel(model: model)
                     .frame(maxHeight: .infinity)
             } else if showScript {
-                fullScriptSection
-                    .frame(maxHeight: .infinity)
+                VStack(alignment: .leading, spacing: 8) {
+                    fullScriptSection
+                        .frame(maxHeight: .infinity)
+                    if !model.simpleFastMode && model.showTranslationKeywords {
+                        TranslationKeywordsView(model: model, resizeHandleOnTop: true)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+            } else if !model.simpleFastMode && model.showTranslationKeywords {
+                VStack(alignment: .leading, spacing: 8) {
+                    TranslationKeywordsView(model: model, resizeHandleOnTop: false)
+                        .frame(maxWidth: .infinity)
+                    Spacer(minLength: 0)
+                }
             }
         }
     }

@@ -41,18 +41,34 @@ enum SpeechRecognitionPolicy {
 
     static func isTransientError(_ error: Error) -> Bool {
         let nsError = error as NSError
+        let desc = nsError.localizedDescription.lowercased()
+        if desc.contains("denied") || desc.contains("restricted") || desc.contains("권한") || desc.contains("허용") {
+            return false
+        }
         let transientDomains: Set<String> = [
             "kAFAssistantErrorDomain",
             "kLSRErrorDomain",
             "com.apple.speech.localspeechrecognition",
             "SFSpeechErrorDomain"
         ]
-        // 1110 = No speech detected, 203 = Retry/empty, 209 = Interrupted, 216/301 = Canceled, 1101/1107 = Local service transient
-        let transientCodes: Set<Int> = [203, 209, 216, 301, 1101, 1107, 1110]
+        // 1 = Internal/audio glitch, 102/300 = LSR transient, 201 = Server busy, 203 = Retry/empty,
+        // 209 = Interrupted, 216/301 = Canceled, 1100/1101/1104/1107 = Local service transient,
+        // 1110 = No speech detected. (1700 = permission/Siri disabled, intentionally non-transient.)
+        let transientCodes: Set<Int> = [1, 102, 201, 203, 209, 216, 300, 301, 1100, 1101, 1104, 1107, 1110]
         if transientDomains.contains(nsError.domain) && transientCodes.contains(nsError.code) { return true }
+        // NSXPCConnectionInterrupted (4097) / NSXPCConnectionInvalidated (4099) when macOS speech daemon restarts.
+        if nsError.domain == NSCocoaErrorDomain && (nsError.code == 4097 || nsError.code == 4099) { return true }
         if nsError.domain == NSURLErrorDomain { return true }
-        let desc = nsError.localizedDescription.lowercased()
-        return desc.contains("no speech detected") || desc.contains("retry") || desc.contains("음성이 감지되지")
+        return desc.contains("no speech detected")
+            || desc.contains("retry")
+            || desc.contains("cancel")
+            || desc.contains("interrupt")
+            || desc.contains("connection")
+            || desc.contains("timed out")
+            || desc.contains("timeout")
+            || desc.contains("음성이 감지되지")
+            || desc.contains("연결")
+            || desc.contains("중단")
     }
 
     static func softBackoffSeconds(attempt: Int) -> Double {
@@ -81,9 +97,23 @@ private final class SpeechAudioSink: @unchecked Sendable {
     private var analyzerConverter: AVAudioConverter?
     private var analyzerSourceFormat: AVAudioFormat?
     private var accepting = false
+    private var muted = false
     private var pendingBuffers: [AVAudioPCMBuffer] = []
     private var lastBuffer = Date()
     private var lastVoice = Date.distantPast
+
+    func setMuted(_ value: Bool) {
+        lock.lock()
+        muted = value
+        if value { pendingBuffers.removeAll() }
+        lock.unlock()
+    }
+
+    var isMuted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return muted
+    }
 
     func setAccepting(_ value: Bool) {
         lock.lock()
@@ -158,6 +188,7 @@ private final class SpeechAudioSink: @unchecked Sendable {
         lock.lock()
         guard accepting else { lock.unlock(); return }
         lastBuffer = Date()
+        if muted { lock.unlock(); return }
         if peak > 0.015 { lastVoice = lastBuffer }
         let request = self.request
         let continuation = self.analyzerContinuation
@@ -246,10 +277,16 @@ final class SpeechCapture {
     private var externalAudio = false
     private var hardRetryCount = 0
     private var softRetryCount = 0
+    private var lastHardRetryAt = Date.distantPast
+    private var lastHardReason = ""
+    private var allowServerFallback = false
     private var lastResult = Date()
     private var locale = "ko-KR"
     private var committed = ""
     private var partial = ""
+    private var lastPublishedPartial = ""
+    private var lastPartialCommitAt = Date.distantPast
+    private var lastTurnsRenderAt = Date.distantPast
     private var speakerAnalyzer: SpeakerAnalyzer?
     private var segmentOrder: [String] = []
     private var segmentTokens: [String: [(text: String, time: Double)]] = [:]
@@ -257,18 +294,20 @@ final class SpeechCapture {
     private var onTurns: (([SpeakerTurn]) -> Void)?
     private var onStatus: ((String) -> Void)?
     private var onText: ((String) -> Void)?
+    private var onInterimText: ((String) -> Void)?
     private var onError: ((String) -> Void)?
     private var onAudioBuffer: ((AVAudioPCMBuffer) -> Void)?
 
-    func start(locale: String, externalAudio: Bool = false, inputDeviceUID: String, onTurns: @escaping ([SpeakerTurn]) -> Void, onSTTStatus: @escaping (String) -> Void, onSpeakerStatus: @escaping (String) -> Void, onText: @escaping (String) -> Void, onError: @escaping (String) -> Void, onAudioBuffer: ((AVAudioPCMBuffer) -> Void)? = nil) async throws {
+    func start(locale: String, externalAudio: Bool = false, inputDeviceUID: String, onTurns: @escaping ([SpeakerTurn]) -> Void, onSTTStatus: @escaping (String) -> Void, onSpeakerStatus: @escaping (String) -> Void, onText: @escaping (String) -> Void, onInterim: ((String) -> Void)? = nil, onError: @escaping (String) -> Void, onAudioBuffer: ((AVAudioPCMBuffer) -> Void)? = nil) async throws {
         stop()
         if !externalAudio { try await AudioPermissions.microphone() }
         try await AudioPermissions.speech()
         self.externalAudio = externalAudio
         self.inputDeviceUID = inputDeviceUID; self.locale = locale
-        self.onText = onText; self.onError = onError; self.onTurns = onTurns; self.onStatus = onSTTStatus; self.onAudioBuffer = onAudioBuffer
-        committed = ""; partial = ""; segmentOrder = []; segmentTokens = [:]; intervals = [:]
-        hardRetryCount = 0; softRetryCount = 0; usingModernAnalyzer = false
+        self.onText = onText; self.onInterimText = onInterim; self.onError = onError; self.onTurns = onTurns; self.onStatus = onSTTStatus; self.onAudioBuffer = onAudioBuffer
+        committed = ""; partial = ""; lastPublishedPartial = ""; lastPartialCommitAt = .distantPast; lastTurnsRenderAt = .distantPast
+        segmentOrder = []; segmentTokens = [:]; intervals = [:]
+        hardRetryCount = 0; softRetryCount = 0; lastHardRetryAt = .distantPast; lastHardReason = ""; allowServerFallback = false; usingModernAnalyzer = false
         active = true
         sink.setAccepting(true)
         let analyzer = SpeakerAnalyzer()
@@ -296,7 +335,10 @@ final class SpeechCapture {
                 guard !Task.isCancelled, let self, self.active else { return }
                 let health = self.sink.health()
                 let now = Date()
-                if !self.externalAudio && now.timeIntervalSince(health.buffer) > 4 {
+                if self.recovery == nil && self.hardRetryCount > 0 && now.timeIntervalSince(self.lastHardRetryAt) > 20 {
+                    self.hardRetryCount = 0
+                }
+                if !self.externalAudio && !self.sink.isMuted && now.timeIntervalSince(health.buffer) > 4 {
                     self.recoverHard(reason: "마이크 입력이 중단되어 재연결 중", rebuildAudio: true)
                 } else if self.recovery == nil && now.timeIntervalSince(self.lastResult) > 15 && health.voice > self.lastResult {
                     // Music, ambient sound, or a stalled on-device task: softly cycle recognition without ever killing listening.
@@ -308,21 +350,35 @@ final class SpeechCapture {
         }
     }
 
+    func setMuted(_ value: Bool) {
+        sink.setMuted(value)
+    }
+
     nonisolated func appendExternalAudio(_ buffer: AVAudioPCMBuffer) {
         sink.append(buffer)
     }
 
     private func startAudio() throws {
         if externalAudio { sink.resetHealth(); return }
-        let configured = try AudioInputDevices.configuredEngine(uid: inputDeviceUID)
+        let configured: (engine: AVAudioEngine, format: AVAudioFormat)
+        do {
+            configured = try AudioInputDevices.configuredEngine(uid: inputDeviceUID)
+        } catch {
+            guard !inputDeviceUID.isEmpty else { throw error }
+            configured = try AudioInputDevices.configuredEngine(uid: "")
+            inputDeviceUID = ""
+            onStatus?("선택한 마이크 연결 실패 · 기본 마이크로 자동 전환됨")
+        }
         engine = configured.engine
         let input = engine.inputNode
         let format = configured.format
         let sink = sink, analyzer = speakerAnalyzer, recorder = onAudioBuffer
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 512, format: format) { buffer, _ in
             sink.append(buffer)
-            analyzer?.append(buffer)
-            recorder?(buffer)
+            if !sink.isMuted {
+                analyzer?.append(buffer)
+                recorder?(buffer)
+            }
         }
         tapped = true
         sink.resetHealth()
@@ -428,6 +484,8 @@ final class SpeechCapture {
                         if isFinal {
                             self.committed = [self.committed, raw].filter { !$0.isEmpty }.joined(separator: "\n")
                             self.partial = ""
+                            self.lastPublishedPartial = ""
+                            self.onInterimText?("")
                             self.onText?(self.committed)
                             var tokens = self.segmentTokens[segmentID] ?? []
                             tokens.append((text: raw, time: safeTime))
@@ -435,7 +493,11 @@ final class SpeechCapture {
                             self.renderTurns()
                         } else {
                             self.partial = raw
-                            self.onText?([self.committed, raw].filter { !$0.isEmpty }.joined(separator: "\n"))
+                            if let onInterim = self.onInterimText {
+                                onInterim(raw)
+                            } else {
+                                self.onText?([self.committed, raw].filter { !$0.isEmpty }.joined(separator: "\n"))
+                            }
                         }
                         self.onStatus?(self.externalAudio ? "Mac 재생음 스트리밍 STT 수신 중" : "실시간 스트리밍 STT 수신 중")
                     }
@@ -461,7 +523,7 @@ final class SpeechCapture {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
-        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+        if recognizer.supportsOnDeviceRecognition && !allowServerFallback { request.requiresOnDeviceRecognition = true }
         self.request = request
         lastResult = Date()
         sink.replace(request)
@@ -472,17 +534,42 @@ final class SpeechCapture {
             Task { @MainActor in
                 guard let self, self.active, self.generation == token else { return }
                 if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.lastResult = Date()
+                    let now = Date()
+                    self.lastResult = now
                     self.hardRetryCount = 0
                     self.softRetryCount = 0
                     if SpeechRecognitionPolicy.shouldCommitBeforeReplacing(previous: self.partial, incoming: text) {
-                        self.commitPartial()
+                        self.commitPartial(emit: true)
                     }
                     self.partial = text
-                    // Publish raw STT before optional token alignment or speaker analysis.
-                    self.onText?([self.committed, text].filter { !$0.isEmpty }.joined(separator: "\n"))
+                    if let onInterim = self.onInterimText {
+                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let endsSentence = trimmed.unicodeScalars.last.map { CharacterSet(charactersIn: ".!?。！？").contains($0) } ?? false
+                        let timeToFlush = now.timeIntervalSince(self.lastPartialCommitAt) >= 1.6 && trimmed.count >= max(10, self.lastPublishedPartial.count + 8)
+                        let revisedEarlier = !self.lastPublishedPartial.isEmpty && !text.hasPrefix(self.lastPublishedPartial)
+                        if final || endsSentence || timeToFlush || revisedEarlier {
+                            self.lastPublishedPartial = text
+                            self.lastPartialCommitAt = now
+                            onInterim("")
+                            self.onText?([self.committed, text].filter { !$0.isEmpty }.joined(separator: "\n"))
+                        } else {
+                            let tail = self.lastPublishedPartial.isEmpty
+                                ? text
+                                : String(text.dropFirst(self.lastPublishedPartial.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                            onInterim(tail.isEmpty ? text : tail)
+                        }
+                    } else {
+                        // Publish raw STT before optional token alignment or speaker analysis.
+                        self.onText?([self.committed, text].filter { !$0.isEmpty }.joined(separator: "\n"))
+                    }
                     self.onStatus?(self.externalAudio ? "Mac 재생음 STT 수신 중" : "STT 수신 중")
-                    if let words, !words.isEmpty { self.segmentTokens[segmentID] = words; self.renderTurns() }
+                    if let words, !words.isEmpty {
+                        self.segmentTokens[segmentID] = words
+                        if final || now.timeIntervalSince(self.lastTurnsRenderAt) >= 1.5 {
+                            self.lastTurnsRenderAt = now
+                            self.renderTurns()
+                        }
+                    }
                 }
                 if final {
                     self.rotate(delay: 0.15)
@@ -539,11 +626,25 @@ final class SpeechCapture {
 
     private func recoverHard(reason: String, rebuildAudio: Bool) {
         guard active, recovery == nil else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastHardRetryAt) > 25 {
+            hardRetryCount = 0
+        }
+        lastHardRetryAt = now
+        lastHardReason = reason
         hardRetryCount += 1
         guard hardRetryCount <= 5 else {
+            let serverOnlyLocale = !usingModernAnalyzer && (recognizer?.supportsOnDeviceRecognition == false)
             stop()
-            onError?("음성 인식이 복구되지 않았습니다. 입력 장치와 권한·네트워크를 확인한 뒤 듣기를 다시 시작해주세요.")
+            let detail = lastHardReason.isEmpty ? "" : " (\(lastHardReason))"
+            let hint = serverOnlyLocale
+                ? " 현재 언어(\(locale))는 Apple 서버 음성 인식을 사용하므로 로컬 Whisper STT로 전환하면 안정적으로 계속 인식할 수 있습니다."
+                : " 입력 장치와 권한·네트워크를 확인한 뒤 듣기를 다시 시작해주세요."
+            onError?("음성 인식이 복구되지 않았습니다\(detail).\(hint)")
             return
+        }
+        if !rebuildAudio && hardRetryCount >= 2 {
+            allowServerFallback = true
         }
         onStatus?(reason)
         commitPartial()
@@ -565,7 +666,16 @@ final class SpeechCapture {
         }
     }
 
-    private func commitPartial() { committed = [committed, partial].filter { !$0.isEmpty }.joined(separator: "\n"); partial = "" }
+    private func commitPartial(emit: Bool = false) {
+        let hadUnpublished = !partial.isEmpty && partial != lastPublishedPartial
+        committed = [committed, partial].filter { !$0.isEmpty }.joined(separator: "\n")
+        partial = ""
+        lastPublishedPartial = ""
+        onInterimText?("")
+        if (emit || hadUnpublished), !committed.isEmpty {
+            onText?(committed)
+        }
+    }
 
     private func renderTurns() {
         var turns: [SpeakerTurn] = []
@@ -579,8 +689,16 @@ final class SpeechCapture {
         onTurns?(turns)
     }
 
+    func flushPartial() {
+        guard active else { return }
+        commitPartial(emit: true)
+    }
+
     func stop() {
         active = false
+        partial = ""
+        lastPublishedPartial = ""
+        onInterimText?("")
         sink.setAccepting(false)
         watchdog?.cancel(); watchdog = nil
         recovery?.cancel(); recovery = nil

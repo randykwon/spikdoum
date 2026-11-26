@@ -65,6 +65,22 @@ enum ConversationExport {
             }
         }
 
+        let recentSummaries = RecentSummaryWindow.allCases.compactMap { window -> (RecentSummaryWindow, SummaryState)? in
+            guard let state = conversation.summaries?[window.summaryKey],
+                  !state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return (window, state)
+        }
+        if !recentSummaries.isEmpty {
+            lines.append("")
+            lines.append("## 구간별 요약")
+            for (window, state) in recentSummaries {
+                lines.append("")
+                lines.append("### \(window.title)")
+                lines.append("")
+                lines.append(state.text)
+            }
+        }
+
         let speakerSummaries = (conversation.summaries ?? [:])
             .filter { $0.key.hasPrefix("speaker-") }
             .sorted { $0.key < $1.key }
@@ -77,6 +93,23 @@ enum ConversationExport {
                 lines.append("### 화자 \(speakerNumber)")
                 lines.append("")
                 lines.append(state.text)
+            }
+        }
+
+        if let presentation = conversation.presentation,
+           (presentation.elapsedSeconds > 0 || !presentation.checklist.isEmpty || !presentation.notesMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+            lines.append("")
+            lines.append("## 프레젠테이션 요약")
+            lines.append("")
+            let elapsedMins = Int(presentation.elapsedSeconds) / 60
+            let elapsedSecs = Int(presentation.elapsedSeconds) % 60
+            lines.append(String(format: "- 목표 시간: %d분 · 실제 진행: %02d:%02d", presentation.targetMinutes, elapsedMins, elapsedSecs))
+            if !presentation.checklist.isEmpty {
+                let done = presentation.checklist.filter(\.isChecked).count
+                lines.append("- 필수 언급 체크리스트: \(done)/\(presentation.checklist.count) 완료")
+                for item in presentation.checklist {
+                    lines.append("  - [\(item.isChecked ? "x" : " ")] \(item.displayLabel)")
+                }
             }
         }
 

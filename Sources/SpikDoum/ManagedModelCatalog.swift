@@ -1,10 +1,23 @@
 import Foundation
 
 enum ManagedRole: String, CaseIterable, Codable, Identifiable, Sendable {
-    case stt, translation
+    case stt, translation, llm
     var id: String { rawValue }
-    var title: String { self == .stt ? "STT" : "번역" }
-    var port: Int { self == .stt ? 18880 : 18881 }
+    var title: String {
+        switch self {
+        case .stt: return "STT"
+        case .translation: return "번역"
+        case .llm: return "코치·요약 LLM"
+        }
+    }
+    /// Ports: 18880 = whisper-server (STT), 18881 = llama-server (Translation), 18884 = llama-server (Coach/Summary/Keywords LLM).
+    var port: Int {
+        switch self {
+        case .stt: return 18880
+        case .translation: return 18881
+        case .llm: return 18884
+        }
+    }
     var executable: String { self == .stt ? "whisper-server" : "llama-server" }
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
     var customFileExtension: String { self == .stt ? "bin" : "gguf" }

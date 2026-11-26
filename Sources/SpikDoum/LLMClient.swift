@@ -3,10 +3,12 @@ import Foundation
 struct LLMClient {
     let settings: EngineSettings
     let key: String
+    var engineOverride: LLMEngine? = nil
     var session: URLSession = .shared
 
     func request(instructions: String, input: String, json: Bool = false) throws -> URLRequest {
-        let isOpenAI = settings.llm == .openAI
+        let effective = engineOverride ?? settings.llm
+        let isOpenAI = effective == .openAI
         let base = isOpenAI ? "https://api.openai.com/v1" : settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: base), ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
               let host = components.host, !host.isEmpty, components.user == nil, components.password == nil, components.query == nil, components.fragment == nil else {

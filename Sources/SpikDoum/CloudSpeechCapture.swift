@@ -97,9 +97,14 @@ final class CloudSpeechCapture {
     private var heartbeat: Task<Void, Never>?
     private var token = UUID()
     private var routeObserver: NSObjectProtocol?
+    private let muteFlag = AudioMuteFlag()
+    func setMuted(_ value: Bool) {
+        muteFlag.set(value)
+    }
+    nonisolated var isMuted: Bool { muteFlag.isMuted }
     nonisolated static func request(key: String, sampleRate: Int, language: String) -> URLRequest {
         var components = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
-        var params = ["model": "nova-3", "language": "multi", "encoding": "linear16", "sample_rate": String(sampleRate), "channels": "1", "diarize_model": "v1", "interim_results": "true", "smart_format": "true", "endpointing": "300"]
+        var params = ["model": "nova-3", "language": "multi", "encoding": "linear16", "sample_rate": String(sampleRate), "channels": "1", "diarize_model": "v1", "interim_results": "true", "smart_format": "true", "endpointing": "180", "vad_events": "true"]
         if language != LanguageCatalog.autoCode {
             params["language_hint"] = LanguageCatalog.whisperLanguageParameter(for: language)
         }
@@ -163,7 +168,9 @@ final class CloudSpeechCapture {
                 onError("[AUDIO_ROUTE_CHANGED] Bluetooth 입력 형식이 변경되었습니다.")
             }
         }
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
+        let muteFlag = muteFlag
+        input.installTap(onBus: 0, bufferSize: 512, format: format) { buffer, _ in
+            guard !muteFlag.isMuted else { return }
             sender.append(buffer)
             onAudioBuffer?(buffer)
         }

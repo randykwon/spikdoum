@@ -87,6 +87,26 @@ struct MenuBarTrayView: View {
                 .tint(model.listening ? .red : .accentColor)
                 .disabled(model.finishingCapture || model.starting || model.current == nil || model.current?.archivedAt != nil)
 
+                if !model.systemAudioOnly {
+                    if model.micMuted {
+                        Button {
+                            model.micMuted = false
+                        } label: {
+                            Image(systemName: "mic.slash.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .help("내 마이크 음소거 해제 (⇧⌘M)")
+                    } else {
+                        Button {
+                            model.micMuted = true
+                        } label: {
+                            Image(systemName: "mic.fill")
+                        }
+                        .help("내 마이크 음소거 (⇧⌘M)")
+                    }
+                }
+
                 Button {
                     model.newConversation(autoStart: true)
                     if !model.autoStartListeningOnNewConversation {

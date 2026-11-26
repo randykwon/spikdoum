@@ -7,6 +7,7 @@ struct TranslationKeywordsView: View {
     static let defaultHeight: Double = 130
 
     @ObservedObject var model: AppModel
+    var resizeHandleOnTop: Bool = false
     @AppStorage("keywordPanelHeight") private var panelHeight: Double = defaultHeight
     @AppStorage("showRelatedKeywords") private var showRelatedKeywords = true
     @State private var dragStartHeight: Double?
@@ -28,6 +29,9 @@ struct TranslationKeywordsView: View {
             return conversation.allRelatedKeywords
         }()
         VStack(alignment: .leading, spacing: 6) {
+            if resizeHandleOnTop {
+                resizeHandle
+            }
             HStack(spacing: 8) {
                 Label(model.recentSeconds == 0 ? "\(model.t("keywords.accumulated")) (\(terms.count))" : model.t("keywords.recent"), systemImage: "number")
                     .font(.caption.bold())
@@ -137,11 +141,13 @@ struct TranslationKeywordsView: View {
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, minHeight: max(32, min(clampedHeight, 48)), alignment: .leading)
             }
-            resizeHandle
+            if !resizeHandleOnTop {
+                resizeHandle
+            }
         }
         .padding(.horizontal, 10)
-        .padding(.top, 9)
-        .padding(.bottom, 4)
+        .padding(.top, resizeHandleOnTop ? 4 : 9)
+        .padding(.bottom, resizeHandleOnTop ? 9 : 4)
         .background(Color.purple.opacity(0.05), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.purple.opacity(hoveringHandle ? 0.35 : 0.14), lineWidth: 1))
         .task(id: model.selectedID) { if model.showTranslationKeywords { await model.extractKeywords(automatic: true) } }
@@ -180,7 +186,8 @@ struct TranslationKeywordsView: View {
                 .onChanged { value in
                     if dragStartHeight == nil { dragStartHeight = min(Self.maxHeight, max(Self.minHeight, panelHeight)) }
                     let base = dragStartHeight ?? Self.defaultHeight
-                    panelHeight = min(Self.maxHeight, max(Self.minHeight, base + value.translation.height))
+                    let delta = resizeHandleOnTop ? -value.translation.height : value.translation.height
+                    panelHeight = min(Self.maxHeight, max(Self.minHeight, base + delta))
                 }
                 .onEnded { _ in
                     dragStartHeight = nil

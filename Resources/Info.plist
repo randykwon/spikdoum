@@ -16,5 +16,6 @@
 <key>NSLocalNetworkUsageDescription</key><string>사용자가 지정한 내부망 LLM 서버에 연결해 번역·답변·요약을 생성합니다.</string>
 <key>NSAudioCaptureUsageDescription</key><string>이어폰으로 듣는 상대방의 대화를 인식하고 번역하기 위해 Mac 재생음을 수집합니다.</string>
 <key>NSScreenCaptureUsageDescription</key><string>통화 중 상대방의 시스템 오디오를 수집하기 위해 화면 및 시스템 오디오 기록 권한이 필요합니다. 화면 영상은 저장하지 않습니다.</string>
+<key>NSAppleEventsUsageDescription</key><string>프레젠테이션 모드에서 Microsoft PowerPoint 및 Keynote 슬라이드를 제어하고 현재 슬라이드와 큐카드를 연동하기 위해 자동화 권한이 필요합니다.</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

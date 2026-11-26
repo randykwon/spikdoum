@@ -107,17 +107,66 @@ enum ManagedSTTPolicy {
     }
 }
 
+/// UFAL LocalAgreement-2 inspired stabilizer for sliding-window Whisper interim hypotheses:
+/// keeps the agreed leading prefix steady across consecutive hypotheses while showing live tail updates.
+struct LocalAgreementTracker: Equatable, Sendable {
+    private(set) var previousHypothesis = ""
+    private(set) var confirmedPrefix = ""
+
+    mutating func update(hypothesis raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return confirmedPrefix }
+        if !previousHypothesis.isEmpty {
+            let agreed = Self.longestAgreedPrefix(previousHypothesis, trimmed)
+            if agreed.count > confirmedPrefix.count {
+                confirmedPrefix = agreed
+            }
+        }
+        previousHypothesis = trimmed
+        if !confirmedPrefix.isEmpty && trimmed.count < confirmedPrefix.count {
+            return confirmedPrefix
+        }
+        return trimmed
+    }
+
+    mutating func reset() {
+        previousHypothesis = ""
+        confirmedPrefix = ""
+    }
+
+    static func longestAgreedPrefix(_ a: String, _ b: String) -> String {
+        let aWords = a.split(separator: " ")
+        let bWords = b.split(separator: " ")
+        if aWords.count >= 2 && bWords.count >= 2 {
+            var matched: [Substring] = []
+            for (w1, w2) in zip(aWords, bWords) {
+                if w1.lowercased() == w2.lowercased() { matched.append(w2) }
+                else { break }
+            }
+            return matched.joined(separator: " ")
+        }
+        // Spaceless CJK character-level agreement
+        var chars: [Character] = []
+        for (c1, c2) in zip(a, b) {
+            if c1 == c2 { chars.append(c2) } else { break }
+        }
+        return String(chars)
+    }
+}
+
 /// Converts either microphone or ScreenCaptureKit buffers into bounded 16kHz PCM batches,
 /// preferring natural silence boundaries over hard mid-word cuts.
 final class ManagedAudioBufferer: @unchecked Sendable {
     private static let sampleRate = 16000
     private static let bytesPerSecond = sampleRate * 2
-    private static let minPauseSplitBytes = bytesPerSecond * 9 / 10    // 0.9s minimum before splitting on natural pause
-    private static let maxChunkBytes = bytesPerSecond * 25 / 10        // 2.5s hard upper bound for continuous speech
-    private static let preRollMaxBytes = bytesPerSecond * 16 / 100     // 160ms pre-roll silence kept before speech onset
-    private static let pauseFramesThreshold = 10                       // 10 * 20ms = 200ms trailing silence
-    private static let minVoicedFrames = 3                             // 3 * 20ms = 60ms sustained speech energy
-    private static let voiceRMSThreshold = 0.012                       // Rejects low-level hum/noise (< 0.012 RMS)
+    private static let minInterimBytes = bytesPerSecond * 32 / 100     // 0.32s minimum speech before first live interim
+    private static let minPauseSplitBytes = bytesPerSecond * 65 / 100  // 0.65s minimum before splitting on natural pause
+    private static let streamingMaxChunkBytes = bytesPerSecond * 2     // 2.0s upper bound for snappy live streaming commits
+    private static let batchMaxChunkBytes = bytesPerSecond * 25 / 10   // 2.5s upper bound for max-accuracy batch mode
+    private static let preRollMaxBytes = bytesPerSecond * 14 / 100     // 140ms pre-roll silence kept before speech onset
+    private static let pauseFramesThreshold = 7                        // 7 * 20ms = 140ms trailing silence
+    private static let minVoicedFrames = 2                             // 2 * 20ms = 40ms sustained speech energy
+    private static let voiceRMSThreshold = 0.011                       // Rejects low-level hum/noise (< 0.011 RMS)
     private static let frameSamples = 320                              // 20ms at 16kHz
     private static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
 
@@ -131,13 +180,29 @@ final class ManagedAudioBufferer: @unchecked Sendable {
     private var frameEnergySum: Double = 0
     private var frameSampleCount = 0
     private var active = false
+    private var muted = false
+    private var interimIntervalSeconds: TimeInterval? = nil
+    private var lastInterimAt = Date.distantPast
     private var onChunk: ((Data) -> Void)?
-    func start(onChunk: @escaping (Data) -> Void) {
+    private var onInterim: ((Data) -> Void)?
+    func setMuted(_ value: Bool) {
+        queue.async {
+            self.muted = value
+            if value { self.resetBuffer() }
+        }
+    }
+    func start(
+        interimInterval: TimeInterval? = nil,
+        onInterim: ((Data) -> Void)? = nil,
+        onChunk: @escaping (Data) -> Void
+    ) {
         queue.async {
             self.active = true
             self.resetBuffer()
             self.converter = nil
             self.sourceFormat = nil
+            self.interimIntervalSeconds = interimInterval
+            self.onInterim = onInterim
             self.onChunk = onChunk
         }
     }
@@ -153,7 +218,7 @@ final class ManagedAudioBufferer: @unchecked Sendable {
         queue.async { self.consume(copy) }
     }
     private func consume(_ buffer: AVAudioPCMBuffer) {
-        guard active else { return }
+        guard active, !muted else { return }
         let format = Self.targetFormat
         if sourceFormat != buffer.format { converter = AVAudioConverter(from: buffer.format, to: format); sourceFormat = buffer.format }
         guard let converter, let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate + 64)) else { return }
@@ -189,11 +254,32 @@ final class ManagedAudioBufferer: @unchecked Sendable {
             pcm = Data(pcm.suffix(Self.preRollMaxBytes))
             return
         }
+        let maxBytes = interimIntervalSeconds != nil ? Self.streamingMaxChunkBytes : Self.batchMaxChunkBytes
         let hitSilenceBoundary = voiced && pcm.count >= Self.minPauseSplitBytes && trailingSilentFrames >= Self.pauseFramesThreshold
-        let hitMaxLength = pcm.count >= Self.maxChunkBytes
+        let hitMaxLength = pcm.count >= maxBytes
         if hitSilenceBoundary || hitMaxLength {
             if voiced { onChunk?(pcm) }
             resetBuffer()
+        } else if voiced,
+                  let interval = interimIntervalSeconds,
+                  let onInterim,
+                  pcm.count >= Self.minInterimBytes {
+            let now = Date()
+            if now.timeIntervalSince(lastInterimAt) >= interval {
+                lastInterimAt = now
+                onInterim(Data(pcm))
+            }
+        }
+    }
+    /// Triggers an immediate interim snapshot if voiced speech is already accumulating (eliminates dead gap right after a chunk commits).
+    func requestImmediateInterimIfVoiced() {
+        queue.async {
+            guard self.active, !self.muted, self.voiced,
+                  self.interimIntervalSeconds != nil,
+                  let onInterim = self.onInterim,
+                  self.pcm.count >= Self.minInterimBytes else { return }
+            self.lastInterimAt = Date()
+            onInterim(Data(self.pcm))
         }
     }
     private func resetBuffer() {
@@ -203,6 +289,7 @@ final class ManagedAudioBufferer: @unchecked Sendable {
         trailingSilentFrames = 0
         frameEnergySum = 0
         frameSampleCount = 0
+        lastInterimAt = .distantPast
     }
     func finish() async -> Data? {
         await withCheckedContinuation { continuation in queue.async {
@@ -215,13 +302,38 @@ final class ManagedAudioBufferer: @unchecked Sendable {
     func stop() { queue.async { self.active = false; self.resetBuffer() } }
 }
 
+final class AudioMuteFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var muted = false
+
+    func set(_ value: Bool) {
+        lock.lock()
+        muted = value
+        lock.unlock()
+    }
+
+    var isMuted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return muted
+    }
+}
+
 @MainActor final class ManagedSpeechCapture {
     private var engine: AVAudioEngine?
     private let bufferer = ManagedAudioBufferer()
     private var pending: [Data] = []
     private var worker: Task<Void, Never>?
+    private var interimTask: Task<Void, Never>?
+    private var agreement = LocalAgreementTracker()
+    private var interimText = ""
+    private var warmCandidateLang: String?
+    private var warmDetectedLang: String?
+    private var warmLangStreak = 0
+    private var allowWarmLanguageLock = false
     private var generation = UUID()
     private var active = false
+    private let muteFlag = AudioMuteFlag()
     private var consecutiveFailures = 0
     private var text = ""
     private var lastCleanChunk = ""
@@ -229,26 +341,53 @@ final class ManagedAudioBufferer: @unchecked Sendable {
     private var language = "en"
     private var key = ""
     private var onText: ((String) -> Void)?
+    private var onInterimText: ((String) -> Void)?
     private var onError: ((String) -> Void)?
     private var onLatency: ((Int) -> Void)?
+    private var onDetectedLanguage: ((LanguageDetectionResult) -> Void)?
     private var routeObserver: NSObjectProtocol?
     private var audioStartedAt = Date.distantPast
-    func start(language: String, externalAudio: Bool, inputDeviceUID: String, key: String, onText: @escaping (String) -> Void, onError: @escaping (String) -> Void, onLatency: @escaping (Int) -> Void, onAudioBuffer: ((AVAudioPCMBuffer) -> Void)? = nil) async throws {
+    func start(
+        language: String,
+        externalAudio: Bool,
+        inputDeviceUID: String,
+        key: String,
+        interimInterval: TimeInterval? = nil,
+        allowWarmLanguageLock: Bool = false,
+        onText: @escaping (String) -> Void,
+        onInterim: ((String) -> Void)? = nil,
+        onError: @escaping (String) -> Void,
+        onLatency: @escaping (Int) -> Void,
+        onDetectedLanguage: ((LanguageDetectionResult) -> Void)? = nil,
+        onAudioBuffer: ((AVAudioPCMBuffer) -> Void)? = nil
+    ) async throws {
         stop()
         if !externalAudio { try await AudioPermissions.microphone() }
-        self.language = language; self.key = key; self.onText = onText; self.onError = onError; self.onLatency = onLatency
-        text = ""; lastCleanChunk = ""; lastCleanChunkAt = .distantPast; active = true; consecutiveFailures = 0
+        self.language = language; self.key = key; self.allowWarmLanguageLock = allowWarmLanguageLock
+        self.onText = onText; self.onInterimText = onInterim; self.onError = onError; self.onLatency = onLatency; self.onDetectedLanguage = onDetectedLanguage
+        text = ""; interimText = ""; agreement.reset(); warmCandidateLang = nil; warmDetectedLang = nil; warmLangStreak = 0
+        lastCleanChunk = ""; lastCleanChunkAt = .distantPast; active = true; consecutiveFailures = 0
         let token = generation
-        bufferer.start { [weak self] data in Task { @MainActor in
-            guard let self, self.active, self.generation == token else { return }; self.enqueue(data)
-        } }
+        bufferer.start(interimInterval: interimInterval, onInterim: interimInterval == nil ? nil : { [weak self] data in
+            Task { @MainActor in
+                guard let self, self.active, self.generation == token else { return }
+                self.runInterim(data, token: token)
+            }
+        }, onChunk: { [weak self] data in
+            Task { @MainActor in
+                guard let self, self.active, self.generation == token else { return }
+                self.enqueue(data)
+            }
+        })
         if externalAudio { return }
         let configured = try AudioInputDevices.configuredEngine(uid: inputDeviceUID)
         let engine = configured.engine
         let input = engine.inputNode
         let format = configured.format
         let bufferer = bufferer
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { buffer, _ in
+        let muteFlag = muteFlag
+        input.installTap(onBus: 0, bufferSize: 512, format: format) { buffer, _ in
+            guard !muteFlag.isMuted else { return }
             bufferer.append(buffer)
             onAudioBuffer?(buffer)
         }
@@ -264,11 +403,86 @@ final class ManagedAudioBufferer: @unchecked Sendable {
             self.onError?("[AUDIO_ROUTE_CHANGED] 로컬 STT 마이크 형식이 바뀌었습니다.")
         } }
     }
+    func setMuted(_ value: Bool) {
+        muteFlag.set(value)
+        bufferer.setMuted(value)
+    }
+    nonisolated var isMuted: Bool { muteFlag.isMuted }
     func updateLanguage(_ newLanguage: String) {
         language = newLanguage
+        warmCandidateLang = nil
+        warmDetectedLang = nil
+        warmLangStreak = 0
+    }
+    func setAllowWarmLanguageLock(_ enabled: Bool) {
+        allowWarmLanguageLock = enabled
+        if !enabled {
+            warmCandidateLang = nil
+            warmDetectedLang = nil
+            warmLangStreak = 0
+        }
     }
     nonisolated func appendExternalAudio(_ buffer: AVAudioPCMBuffer) { bufferer.append(buffer) }
+
+    private var effectiveRequestLanguage: String {
+        if language == LanguageCatalog.autoCode {
+            if allowWarmLanguageLock,
+               let warm = warmDetectedLang,
+               Date().timeIntervalSince(lastCleanChunkAt) <= 8.0 {
+                return warm
+            }
+            return LanguageCatalog.autoCode
+        }
+        return language
+    }
+
+    private func publishInterimText() {
+        if let onInterimText {
+            onInterimText(interimText)
+        } else {
+            let combined = [text, interimText].filter { !$0.isEmpty }.joined(separator: "\n")
+            if !combined.isEmpty { onText?(combined) }
+        }
+    }
+
+    private func runInterim(_ pcm: Data, token: UUID) {
+        // Never queue or compete with finalized utterances or another in-flight interim request.
+        guard interimTask == nil, pending.isEmpty, worker == nil else { return }
+        let reqLang = effectiveRequestLanguage
+        let contextPrompt = Date().timeIntervalSince(lastCleanChunkAt) <= 3.5
+            ? ManagedSTTPolicy.safePrompt(from: lastCleanChunk)
+            : ""
+        let key = self.key
+        interimTask = Task { [weak self] in
+            defer { Task { @MainActor in self?.interimTask = nil } }
+            let start = Date()
+            do {
+                let result = try await ManagedSTTClient(key: key).transcribe(
+                    wave: ManagedSTTClient.wave(pcm: pcm),
+                    language: reqLang,
+                    prompt: contextPrompt
+                )
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self, self.active, self.generation == token, self.pending.isEmpty else { return }
+                    self.onLatency?(Int(Date().timeIntervalSince(start) * 1000))
+                    if let cleaned = ManagedSTTPolicy.sanitize(result, previousChunk: self.lastCleanChunk) {
+                        let stabilized = self.agreement.update(hypothesis: cleaned)
+                        if !stabilized.isEmpty && stabilized != self.interimText {
+                            self.interimText = stabilized
+                            self.publishInterimText()
+                        }
+                    }
+                }
+            } catch {
+                // Interim misses are harmless; the final chunk will deliver the authoritative transcription.
+            }
+        }
+    }
+
     private func enqueue(_ pcm: Data) {
+        interimTask?.cancel()
+        interimTask = nil
         if pending.count >= 24 {
             pending.removeFirst()
         }
@@ -279,29 +493,58 @@ final class ManagedAudioBufferer: @unchecked Sendable {
         let token = generation
         worker = Task { [weak self] in
             guard let self else { return }
-            defer { if self.generation == token { self.worker = nil } }
+            defer {
+                if self.generation == token {
+                    self.worker = nil
+                    if self.active && self.pending.isEmpty {
+                        self.bufferer.requestImmediateInterimIfVoiced()
+                    }
+                }
+            }
             while !Task.isCancelled && self.generation == token && !self.pending.isEmpty {
                 let data = self.pending.removeFirst(); let start = Date()
                 do {
                     let contextPrompt = Date().timeIntervalSince(self.lastCleanChunkAt) <= 3.5
                         ? ManagedSTTPolicy.safePrompt(from: self.lastCleanChunk)
                         : ""
-                    let result = try await ManagedSTTClient(key: self.key).transcribe(
+                    // Use fast `json` response format (2.1x faster than `verbose_json` on M5 Metal)
+                    // and run instant local script/NLLanguageRecognizer detection (<0.1ms) on the transcript.
+                    let rawText = try await ManagedSTTClient(key: self.key).transcribe(
                         wave: ManagedSTTClient.wave(pcm: data),
-                        language: self.language,
+                        language: self.effectiveRequestLanguage,
                         prompt: contextPrompt
                     )
                     guard self.generation == token, !Task.isCancelled else { return }
                     self.consecutiveFailures = 0
                     self.onLatency?(Int(Date().timeIntervalSince(start) * 1000))
-                    if let cleaned = ManagedSTTPolicy.sanitize(result, previousChunk: self.lastCleanChunk) {
+                    self.interimText = ""
+                    self.agreement.reset()
+                    self.onInterimText?("")
+                    if let cleaned = ManagedSTTPolicy.sanitize(rawText, previousChunk: self.lastCleanChunk) {
                         self.lastCleanChunk = cleaned
                         self.lastCleanChunkAt = Date()
+                        if self.language == LanguageCatalog.autoCode,
+                           let textResult = LanguageCatalog.detectLanguageDetailed(for: cleaned) {
+                            self.onDetectedLanguage?(textResult)
+                            if self.allowWarmLanguageLock {
+                                if self.warmCandidateLang == textResult.language.code {
+                                    self.warmLangStreak += 1
+                                    if self.warmLangStreak >= 2 {
+                                        self.warmDetectedLang = textResult.language.code
+                                    }
+                                } else {
+                                    self.warmCandidateLang = textResult.language.code
+                                    self.warmLangStreak = 1
+                                    self.warmDetectedLang = nil
+                                }
+                            }
+                        }
                         self.text = [self.text, cleaned].filter { !$0.isEmpty }.joined(separator: "\n")
                         self.onText?(self.text)
                     } else {
                         // Reset prompt context after filtered silence/hallucination so it cannot poison the next chunk.
                         self.lastCleanChunk = ""
+                        if self.onInterimText == nil && !self.text.isEmpty { self.onText?(self.text) }
                     }
                 } catch {
                     guard self.generation == token && !Task.isCancelled else { return }
@@ -317,6 +560,7 @@ final class ManagedAudioBufferer: @unchecked Sendable {
     }
     func finish() async {
         stopMicrophone()
+        interimTask?.cancel(); interimTask = nil
         if let tail = await bufferer.finish(), active { enqueue(tail) }
         if let worker { await worker.value }
     }
@@ -326,6 +570,7 @@ final class ManagedAudioBufferer: @unchecked Sendable {
     }
     func stop() {
         active = false; generation = UUID(); stopMicrophone(); bufferer.stop()
+        interimTask?.cancel(); interimTask = nil; interimText = ""; agreement.reset()
         worker?.cancel(); worker = nil; pending = []
     }
 }

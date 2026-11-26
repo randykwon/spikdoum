@@ -28,6 +28,11 @@ struct ManagedServerStatus {
     @Published var lastError: String?
     @Published private(set) var selectedSTT: String
     @Published private(set) var selectedTranslation: String
+    @Published private(set) var selectedLLM: String
+    @Published var whisperAudioContext: Int = SpeedQualityTier.loadSTT().whisperAudioContext
+    @Published var whisperBestOf: Int = SpeedQualityTier.loadSTT().whisperBestOf
+    private var launchedAudioContext: Int?
+    private var launchedBestOf: Int?
     let store: ManagedModelStore
     let runtimeRoot: URL
     private let defaults: UserDefaults
@@ -40,6 +45,20 @@ struct ManagedServerStatus {
     private var cpuSamples: [ManagedRole: (pid: Int32, cpuNS: Double, at: Date)] = [:]
     private var monitor: Task<Void, Never>?
 
+    /// Priority order for choosing the best installed local GGUF model for coaching, summaries, and keywords.
+    static let preferredLLMModelOrder: [String] = [
+        "qwen3-4b-q4",
+        "qwen25-7b-q4",
+        "gemma3-12b-q4",
+        "gemma3-4b-q4",
+        "qwen25-3b-q4",
+        "qwen3-17b-q8",
+        "llama32-3b-q4",
+        "qwen25-15b-q4",
+        "gemma2-2b-q4",
+        "qwen25-05b-q4"
+    ]
+
     init(root: URL? = nil, runtimeRoot: URL? = nil, defaults: UserDefaults = .standard) {
         self.defaults = defaults
         let support = AppStorageMigration.appSupportDirectory().appendingPathComponent("ManagedModels")
@@ -47,11 +66,16 @@ struct ManagedServerStatus {
         self.runtimeRoot = runtimeRoot ?? (Bundle.main.resourceURL ?? URL(fileURLWithPath: ".")).appendingPathComponent("ManagedRuntime")
         selectedSTT = defaults.string(forKey: "managedSTTModel") ?? "whisper-base"
         selectedTranslation = defaults.string(forKey: "managedTranslationModel") ?? "qwen25-15b-q4"
+        selectedLLM = defaults.string(forKey: "managedLLMModel") ?? "qwen3-4b-q4"
         if let data = defaults.data(forKey: Self.customModelsKey),
            let loaded = try? JSONDecoder().decode([CustomManagedModel].self, from: data) {
             customModels = loaded
         }
         refreshInstalled()
+        if defaults.string(forKey: "managedLLMModel") == nil,
+           let best = bestInstalledLLMModel() {
+            selectedLLM = best.id
+        }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
@@ -64,11 +88,31 @@ struct ManagedServerStatus {
         ManagedModelCatalog.all + customModels.map(\.asManagedModel)
     }
     func models(for role: ManagedRole) -> [ManagedModel] {
-        allModels.filter { $0.role == role }
+        switch role {
+        case .stt:
+            return allModels.filter { $0.role == .stt }
+        case .translation:
+            return allModels.filter { $0.role == .translation }
+        case .llm:
+            // All GGUF models (built-in and custom) can serve both translation and coach/summary LLM without duplicating files on disk.
+            return allModels.filter { $0.role == .translation || $0.role == .llm }
+        }
+    }
+    func bestInstalledLLMModel() -> ManagedModel? {
+        let candidates = models(for: .llm).filter { installed.contains($0.id) }
+        for id in Self.preferredLLMModelOrder {
+            if let match = candidates.first(where: { $0.id == id }) { return match }
+        }
+        return candidates.first
     }
     func selected(_ role: ManagedRole) -> ManagedModel? {
-        let id = role == .stt ? selectedSTT : selectedTranslation
-        return allModels.first { $0.id == id }
+        let id: String
+        switch role {
+        case .stt: id = selectedSTT
+        case .translation: id = selectedTranslation
+        case .llm: id = selectedLLM
+        }
+        return models(for: role).first { $0.id == id }
     }
     func refreshInstalled() {
         installed = Set(allModels.filter { store.installed($0) }.map(\.id))
@@ -109,11 +153,18 @@ struct ManagedServerStatus {
             defaults.set(data, forKey: Self.customModelsKey)
         }
     }
-    func select(_ model: ManagedModel) async {
+    func select(_ model: ManagedModel, for targetRole: ManagedRole? = nil) async {
         guard installed.contains(model.id) else { lastError = "모델을 먼저 다운로드해주세요."; return }
-        if selected(model.role)?.id != model.id { await stop(model.role) }
-        if model.role == .stt { selectedSTT = model.id; defaults.set(model.id, forKey: "managedSTTModel") }
-        else { selectedTranslation = model.id; defaults.set(model.id, forKey: "managedTranslationModel") }
+        let role = targetRole ?? model.role
+        if selected(role)?.id != model.id { await stop(role) }
+        switch role {
+        case .stt:
+            selectedSTT = model.id; defaults.set(model.id, forKey: "managedSTTModel")
+        case .translation:
+            selectedTranslation = model.id; defaults.set(model.id, forKey: "managedTranslationModel")
+        case .llm:
+            selectedLLM = model.id; defaults.set(model.id, forKey: "managedLLMModel")
+        }
     }
     func download(_ model: ManagedModel) async throws {
         guard downloads[model.id] == nil else { throw CloudFailure(message: "이미 다운로드 중입니다.") }
@@ -138,6 +189,7 @@ struct ManagedServerStatus {
     func cancelDownload(_ id: String) { downloads[id]?.cancel() }
     func remove(_ model: ManagedModel) async {
         if selected(model.role)?.id == model.id { await stop(model.role) }
+        if selectedLLM == model.id { await stop(.llm) }
         do {
             try store.remove(model)
             if model.isCustom {
@@ -150,13 +202,21 @@ struct ManagedServerStatus {
                 }
             }
             refreshInstalled()
+            if selectedLLM == model.id {
+                selectedLLM = bestInstalledLLMModel()?.id ?? "qwen3-4b-q4"
+                defaults.set(selectedLLM, forKey: "managedLLMModel")
+            }
         } catch { lastError = error.localizedDescription }
     }
     func ensureReady(_ role: ManagedRole) async throws {
         if let starting = starts[role] { return try await starting.value }
         if let process = processes[role], process.isRunning {
-            guard servers[role]?.phase == .ready else { throw CloudFailure(message: "\(role.title) 서버가 아직 준비되지 않았습니다. 모델 관리에서 상태와 로그를 확인해주세요.") }
-            return
+            if role == .stt && (launchedAudioContext != whisperAudioContext || launchedBestOf != whisperBestOf) {
+                await stop(.stt)
+            } else {
+                guard servers[role]?.phase == .ready else { throw CloudFailure(message: "\(role.title) 서버가 아직 준비되지 않았습니다. 모델 관리에서 상태와 로그를 확인해주세요.") }
+                return
+            }
         }
         guard servers[role]?.phase != .stopping else { throw CloudFailure(message: "서버를 중지 중입니다. 잠시 후 다시 시도해주세요.") }
         let id = UUID(); startIDs[role] = id
@@ -174,7 +234,11 @@ struct ManagedServerStatus {
         let generation = UUID(); generations[role] = generation
         var status = ManagedServerStatus(); status.phase = .starting; servers[role] = status
         let process = Process(); process.executableURL = executable
-        process.arguments = Self.arguments(role: role, model: store.file(model))
+        process.arguments = Self.arguments(role: role, model: store.file(model), audioContext: whisperAudioContext, bestOf: whisperBestOf)
+        if role == .stt {
+            launchedAudioContext = whisperAudioContext
+            launchedBestOf = whisperBestOf
+        }
         let key = UUID().uuidString + UUID().uuidString
         keys[role] = key
         var environment = ProcessInfo.processInfo.environment
@@ -225,13 +289,22 @@ struct ManagedServerStatus {
             throw error
         }
     }
-    nonisolated static func arguments(role: ManagedRole, model: URL) -> [String] {
+    nonisolated static func arguments(role: ManagedRole, model: URL, audioContext: Int = 512, bestOf: Int = 1) -> [String] {
         let threads = String(min(6, max(4, ProcessInfo.processInfo.activeProcessorCount / 2)))
         let common = ["-m", model.path, "--host", "127.0.0.1", "--port", String(role.port)]
         if role == .stt {
             // Keep temperature fallback enabled (no -nf) and disable cross-segment carry-over (-mc 0)
             // so whisper-large-v3-turbo cannot lock into repetition loops on silence or background music.
-            return common + ["-l", "auto", "-nt", "-fa", "-bo", "1", "-mc", "0", "-et", "2.2", "-sns", "-t", threads]
+            // Bounding `-ac` (384–768 frames vs default 1500/30s) speeds up M5 Metal encoding by ~2.5–3.5×,
+            // while large-v3 / turbo architectures require >= 512 frames to preserve encoder positional accuracy.
+            let modelName = model.lastPathComponent.lowercased()
+            let minSafeContext = (modelName.contains("large-v3") || modelName.contains("turbo")) ? 512 : 256
+            let effectiveAC = max(minSafeContext, audioContext)
+            return common + ["-l", "auto", "-nt", "-fa", "-bo", String(max(1, bestOf)), "-ac", String(effectiveAC), "-mc", "0", "-et", "2.2", "-sns", "-t", threads]
+        }
+        if role == .llm {
+            // Dedicated coach/summary/keyword LLM: 8K context + 2 parallel slots so keywords and coach/summary run concurrently without blocking each other.
+            return common + ["-c", "8192", "-ngl", "99", "-fa", "on", "--cache-prompt", "--cache-reuse", "256", "-t", threads, "--parallel", "2", "--reasoning", "off"]
         }
         return common + ["-c", "4096", "-ngl", "99", "-fa", "on", "--cache-prompt", "--cache-reuse", "256", "-t", threads, "--parallel", "1", "--reasoning", "off"]
     }
@@ -346,6 +419,95 @@ struct ManagedServerStatus {
             throw CloudFailure(message: "자체 번역 결과가 비어 있습니다.")
         }
         record(.translation, latency: Int(Date().timeIntervalSince(start) * 1000))
+        return cleaned
+    }
+
+    /// Runs a general instruction-following LLM request on the dedicated managed `llama-server` (port 18884)
+    /// for conversation coaching, summaries, keywords, script polishing, and presentation aids.
+    func generateLLM(
+        instructions: String,
+        input: String,
+        json: Bool = false,
+        maxTokens: Int? = nil,
+        onDelta: (@MainActor (String) -> Void)? = nil
+    ) async throws -> String {
+        try await ensureReady(.llm)
+        let url = ManagedRole.llm.baseURL.appendingPathComponent("v1/chat/completions")
+        let tokenLimit = maxTokens ?? (json ? 1200 : 700)
+        var payload: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": instructions],
+                ["role": "user", "content": input]
+            ],
+            "temperature": json ? 0.15 : 0.35,
+            "max_tokens": tokenLimit,
+            "cache_prompt": true,
+            "stream": true
+        ]
+        if json {
+            payload["response_format"] = ["type": "json_object"]
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 90
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let key = authorization(.llm)
+        if !key.isEmpty { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let start = Date()
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CloudFailure(message: "자체 로컬 LLM 서버의 HTTP 응답을 확인하지 못했습니다.")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw CloudFailure(message: "자체 로컬 LLM 서버 HTTP \(http.statusCode). 모델 관리에서 서버 상태를 확인해주세요.")
+        }
+
+        var accumulated = ""
+        var rawLines: [String] = []
+        var sawSSE = false
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            if trimmedLine.hasPrefix("data:") {
+                sawSSE = true
+                let dataPart = trimmedLine.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                if dataPart == "[DONE]" { break }
+                guard let data = dataPart.data(using: .utf8),
+                      let jsonObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = jsonObj["choices"] as? [[String: Any]],
+                      let first = choices.first else { continue }
+                if let delta = (first["delta"] as? [String: Any])?["content"] as? String, !delta.isEmpty {
+                    accumulated += delta
+                    if let onDelta {
+                        let visible = Self.visibleStreamingTranslation(accumulated)
+                        if !visible.isEmpty { onDelta(visible) }
+                    }
+                } else if let content = (first["message"] as? [String: Any])?["content"] as? String, !content.isEmpty {
+                    accumulated = content
+                    if let onDelta {
+                        let visible = Self.visibleStreamingTranslation(accumulated)
+                        if !visible.isEmpty { onDelta(visible) }
+                    }
+                }
+            } else if !sawSSE, !trimmedLine.isEmpty {
+                rawLines.append(trimmedLine)
+            }
+        }
+        if !sawSSE && accumulated.isEmpty && !rawLines.isEmpty {
+            let joined = rawLines.joined(separator: "\n")
+            if let data = joined.data(using: .utf8),
+               let parsed = try? LocalTranslator.parse(data, path: "choices.0.message.content") {
+                accumulated = parsed
+            }
+        }
+        let cleaned = Self.stripThinkingTags(accumulated)
+        guard !cleaned.isEmpty else {
+            throw CloudFailure(message: "자체 로컬 LLM 응답이 비어 있습니다.")
+        }
+        record(.llm, latency: Int(Date().timeIntervalSince(start) * 1000))
         return cleaned
     }
     nonisolated static func visibleStreamingTranslation(_ text: String) -> String {

@@ -30,29 +30,30 @@ struct ManagedModelsView: View {
                     Picker("종류", selection: $roleFilter) {
                         Text("전체 (\(manager.allModels.count))").tag("all")
                         Text("STT 모델 (\(manager.models(for: .stt).count))").tag(ManagedRole.stt.rawValue)
-                        Text("번역 모델 (\(manager.models(for: .translation).count))").tag(ManagedRole.translation.rawValue)
+                        Text("번역 · LLM 모델 (\(manager.models(for: .translation).count))").tag(ManagedRole.translation.rawValue)
                     }
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 360)
+                    .frame(maxWidth: 400)
                     Spacer()
                     Text("설치됨 \(manager.installed.count)개").font(.caption).foregroundStyle(.secondary)
                     Button { importCustomModel(role: .stt) } label: { Label("로컬 STT (.bin)", systemImage: "plus") }
                         .controlSize(.small)
                         .help("직접 내려받은 Whisper GGML .bin 모델 파일 추가")
-                    Button { importCustomModel(role: .translation) } label: { Label("로컬 번역 (.gguf)", systemImage: "plus") }
+                    Button { importCustomModel(role: .translation) } label: { Label("로컬 GGUF (.gguf)", systemImage: "plus") }
                         .controlSize(.small)
-                        .help("직접 내려받은 llama.cpp .gguf 번역 모델 파일 추가")
+                        .help("직접 내려받은 llama.cpp .gguf 모델 파일 추가 (번역 및 코치·요약 LLM 겸용)")
                 }
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if selectedTab == "models" {
-                        let visibleRoles = ManagedRole.allCases.filter { roleFilter == "all" || roleFilter == $0.rawValue }
+                        let catalogRoles: [ManagedRole] = [.stt, .translation]
+                        let visibleRoles = catalogRoles.filter { roleFilter == "all" || roleFilter == $0.rawValue }
                         ForEach(visibleRoles) { role in
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
-                                    Text(role.title + " 모델").font(.headline)
-                                    Text(role == .stt ? "Whisper.cpp · Metal GPU" : "llama.cpp · Metal GPU")
+                                    Text(role == .stt ? "STT 모델" : "번역 · 코치/요약 LLM 모델").font(.headline)
+                                    Text(role == .stt ? "Whisper.cpp · Metal GPU" : "llama.cpp · Metal GPU (번역/코치 공용)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -95,17 +96,25 @@ struct ManagedModelsView: View {
     }
 
     private func inUse(_ role: ManagedRole) -> Bool {
-        (model.listening || model.starting || model.finishingCapture) && (role == .stt ? model.settings.stt == .managed : model.settings.translation == .managed)
+        let active = model.listening || model.starting || model.finishingCapture
+        switch role {
+        case .stt: return active && model.settings.stt == .managed
+        case .translation: return active && model.settings.translation == .managed
+        case .llm: return active && (model.settings.effectiveLLM(for: .coach) == .managed || model.settings.effectiveLLM(for: .summary) == .managed || model.settings.effectiveLLM(for: .keywords) == .managed)
+        }
     }
 
     private func isActiveInUse(_ item: ManagedModel) -> Bool {
-        inUse(item.role) && manager.selected(item.role)?.id == item.id
+        if inUse(item.role) && manager.selected(item.role)?.id == item.id { return true }
+        if item.role == .translation && inUse(.llm) && manager.selected(.llm)?.id == item.id { return true }
+        return false
     }
 
     private func modelRow(_ item: ManagedModel) -> some View {
         let installed = manager.installed.contains(item.id)
         let chosen = manager.selected(item.role)?.id == item.id
         let applied = chosen && (item.role == .stt ? model.settings.stt == .managed : model.settings.translation == .managed)
+        let appliedAsLLM = item.role == .translation && model.settings.llm == .managed && manager.selectedLLM == item.id
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 5) {
@@ -120,7 +129,10 @@ struct ManagedModelsView: View {
                                 .foregroundStyle(item.isCustom ? .purple : .blue)
                         }
                         if applied {
-                            Text("적용됨").font(.caption.bold()).foregroundStyle(.green)
+                            Text(item.role == .stt ? "STT 적용됨" : "번역 적용됨").font(.caption.bold()).foregroundStyle(.green)
+                        }
+                        if appliedAsLLM {
+                            Text("코치·요약 LLM 적용됨").font(.caption.bold()).foregroundStyle(.teal)
                         }
                     }
                     Text(item.sizeLabel + " · " + item.note).font(.caption).foregroundStyle(.secondary)
@@ -132,9 +144,18 @@ struct ManagedModelsView: View {
                 if manager.transfers[item.id] != nil {
                     Button("다운로드 취소") { manager.cancelDownload(item.id) }
                 } else if installed {
-                    Button(applied ? "다시 적용" : "적용") { apply(item) }.disabled(model.starting || working.contains(item.role))
+                    if item.role == .translation {
+                        Button(applied ? "번역 재적용" : "번역 적용") { apply(item) }
+                            .disabled(model.starting || working.contains(.translation))
+                        Button(appliedAsLLM ? "LLM 재적용" : "코치 LLM 적용") { applyAsLLM(item) }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.teal)
+                            .disabled(model.starting || working.contains(.llm))
+                    } else {
+                        Button(applied ? "다시 적용" : "적용") { apply(item) }.disabled(model.starting || working.contains(item.role))
+                    }
                     Button { removing = item } label: { Image(systemName: "trash") }.help("모델 파일 삭제")
-                        .disabled(isActiveInUse(item) || working.contains(item.role))
+                        .disabled(isActiveInUse(item) || working.contains(item.role) || working.contains(.llm))
                 } else {
                     Button("다운로드") { Task { do { try await manager.download(item) } catch {} } }.buttonStyle(.borderedProminent)
                 }
@@ -174,6 +195,19 @@ struct ManagedModelsView: View {
                 }
             } catch {
                 model.restartingForSettingsChange = false
+                manager.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func applyAsLLM(_ item: ManagedModel) {
+        working.insert(.llm)
+        Task {
+            defer { working.remove(.llm) }
+            await model.switchLLMEngine(.managed, managedModelID: item.id)
+            do {
+                try await manager.ensureReady(.llm)
+            } catch {
                 manager.lastError = error.localizedDescription
             }
         }

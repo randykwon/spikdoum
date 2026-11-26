@@ -49,7 +49,9 @@ extension AppModel {
     }
     func pauseListening() {
         guard !finishingCapture else { return }
-        guard listening && settings.stt == .managed else {
+        guard listening && (settings.stt == .managed || settings.stt == .parakeet) else {
+            capture.flushPartial()
+            systemSpeech.flushPartial()
             stop()
             translateLatest()
             Task { [weak self] in await self?.finishPendingAnalysis() }
@@ -59,8 +61,13 @@ extension AppModel {
         sttStatus = "마지막 음성 묶음 인식 중…"
         let run = captureRun
         Task {
-            await managedMic.finish()
-            await managedSystem.finish()
+            if settings.stt == .parakeet {
+                await parakeetMic.finish()
+                await parakeetSystem.finish()
+            } else {
+                await managedMic.finish()
+                await managedSystem.finish()
+            }
             guard captureRun == run else { return }
             stop()
             translateLatest()
@@ -81,6 +88,7 @@ extension AppModel {
         let prefix = current?.transcript ?? ""
         let run = UUID()
         captureRun = run
+        liveSTT.clear()
         lastTranscriptChange = Date()
         translationBatchStartedAt = nil
         duplex = DuplexTranscript()
@@ -88,9 +96,30 @@ extension AppModel {
         let speakerOffset = previousTurns.compactMap(\.speaker).max() ?? 0
         defer { starting = false }
         do {
-            if settings.stt == .managed || settings.translation == .managed { sttStatus = "자체 모델 서버 준비 중…" }
-            if settings.stt == .managed { try await managedModels.ensureReady(.stt) }
+            // Parakeet TDT v3 supports English and 24 European languages.
+            // If Korean/Japanese/Chinese is selected, fall back cleanly to Whisper (if installed) or Apple STT.
+            var effectiveSTT = settings.stt
+            if effectiveSTT == .parakeet {
+                let primaryLang = systemAudioOnly ? language : effectiveMicWhisperLanguage
+                if !SpeedQualityTier.supportsParakeet(languageCode: primaryLang, preferredAutoCodes: autoLanguagePrefs.preferredCodes) {
+                    let hasWhisper = managedModels.selected(.stt).map { managedModels.installed.contains($0.id) } ?? false
+                    effectiveSTT = hasWhisper ? .managed : .apple
+                    presetNotice = "Parakeet ANE는 영어·유럽어 전용입니다. 현재 언어(\(languageName))에 맞춰 \(hasWhisper ? "Whisper" : "Apple STT")로 자동 인식합니다."
+                }
+            }
+            if effectiveSTT == .parakeet {
+                sttStatus = parakeetModels.isLoaded ? "Parakeet ANE 준비 완료" : "Parakeet ANE CoreML 모델 로딩 중…"
+                _ = try await parakeetModels.ensureReady()
+            }
+            if effectiveSTT == .managed || settings.translation == .managed { sttStatus = "자체 모델 서버 준비 중…" }
+            if effectiveSTT == .managed { try await managedModels.ensureReady(.stt) }
             if settings.translation == .managed { try await managedModels.ensureReady(.translation) }
+            // Warm up dedicated local LLM asynchronously in the background so listening starts with zero added delay.
+            if !simpleFastMode && (settings.effectiveLLM(for: .coach) == .managed || settings.effectiveLLM(for: .summary) == .managed || settings.effectiveLLM(for: .keywords) == .managed) {
+                Task { [weak self] in
+                    _ = try? await self?.managedModels.ensureReady(.llm)
+                }
+            }
             warmUpTranslationEngine()
             let recorder = audioRecorder
             let shouldRecord = recordAudioForReplay && id != nil
@@ -122,15 +151,48 @@ extension AppModel {
                         presetNotice = "이전에 선택한 마이크가 연결되지 않아 시스템 기본 입력으로 자동 전환했습니다."
                     }
                 }
-                if settings.stt == .managed {
-                    try await managedMic.start(language: effectiveMicWhisperLanguage, externalAudio: false, inputDeviceUID: selectedInputUID, key: managedModels.authorization(.stt), onText: { [weak self] text in
+                if effectiveSTT == .parakeet {
+                    try await parakeetMic.start(
+                        modelManager: parakeetModels,
+                        externalAudio: false,
+                        inputDeviceUID: selectedInputUID,
+                        interimInterval: sttTier.whisperStreamingInterval ?? 0.28,
+                        onText: { [weak self] text in
+                            guard let self, self.captureRun == run else { return }
+                            self.liveSTT.clear(sourceTag: "마이크")
+                            self.receiveDuplex(source: "마이크", text: text, prefix: prefix)
+                        },
+                        onInterim: { [weak self] interim in
+                            guard let self, self.captureRun == run else { return }
+                            self.liveSTT.update(text: interim, sourceTag: "마이크")
+                        },
+                        onError: { [weak self] error in
+                            guard let self, self.captureRun == run else { return }; self.handleCaptureFailure(error)
+                        },
+                        onLatency: { _ in },
+                        onAudioBuffer: micAudioSink
+                    )
+                    speakerStatus = "Parakeet TDT v3 · Apple Neural Engine 초저지연 스트리밍"
+                } else if effectiveSTT == .managed {
+                    let streamingStep = sttTier.whisperStreamingInterval
+                    let allowLock = autoLanguagePrefs.mode == .singleLanguageFast
+                    try await managedMic.start(language: effectiveMicWhisperLanguage, externalAudio: false, inputDeviceUID: selectedInputUID, key: managedModels.authorization(.stt), interimInterval: streamingStep, allowWarmLanguageLock: allowLock, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
+                        self.liveSTT.clear(sourceTag: "마이크")
                         self.receiveDuplex(source: "마이크", text: text, prefix: prefix)
+                    }, onInterim: { [weak self] interim in
+                        guard let self, self.captureRun == run else { return }
+                        self.liveSTT.update(text: interim, sourceTag: "마이크")
                     }, onError: { [weak self] error in
                         guard let self, self.captureRun == run else { return }; self.handleCaptureFailure(error)
-                    }, onLatency: { [weak self] ms in self?.managedModels.record(.stt, latency: ms) }, onAudioBuffer: micAudioSink)
-                    speakerStatus = "자체 Whisper STT · 무음 경계/최대 2.5초 묶음 · 내 마이크 + 입력 경로 구분"
-                } else if settings.stt == .deepgram {
+                    }, onLatency: { [weak self] ms in self?.managedModels.record(.stt, latency: ms) }, onDetectedLanguage: { [weak self] detected in
+                        guard let self, self.captureRun == run else { return }
+                        self.recordDetectedLanguage(detected)
+                    }, onAudioBuffer: micAudioSink)
+                    speakerStatus = streamingStep != nil
+                        ? "자체 Whisper STT · \(Int((streamingStep ?? 0.35) * 1000))ms 슬라이딩 스트리밍 · 입력 경로 구분"
+                        : "자체 Whisper STT · 최고 정확도 문장 단위 인식 · 입력 경로 구분"
+                } else if effectiveSTT == .deepgram {
                     try await cloudCapture.start(key: SecretStore.read("deepgram"), inputDeviceUID: selectedInputUID, language: effectiveMicWhisperLanguage, onUpdate: { [weak self] full, stable, turns in
                         guard let self, self.selectedID == id, self.captureRun == run else { return }
                         if self.includeSystemAudio {
@@ -155,6 +217,7 @@ extension AppModel {
                 } else {
                     stableCloudTranscript = nil
                     let appleLocale = effectiveMicAppleLocale
+                    let micSourceTag: String? = includeSystemAudio ? "마이크" : nil
                     try await capture.start(locale: appleLocale, inputDeviceUID: selectedInputUID, onTurns: { [weak self] turns in
                         guard let self, self.selectedID == id, self.captureRun == run, !self.includeSystemAudio,
                               let index = self.conversations.firstIndex(where: { $0.id == id }) else { return }
@@ -166,15 +229,19 @@ extension AppModel {
                         self.scheduleSave()
                     }, onSTTStatus: { [weak self] status in
                         guard let self, self.captureRun == run else { return }
-                        self.sttStatus = status
+                        if self.sttStatus != status { self.sttStatus = status }
                     }, onSpeakerStatus: { [weak self] status in
                         guard let self, self.captureRun == run else { return }
-                        self.speakerStatus = status
+                        if self.speakerStatus != status { self.speakerStatus = status }
                     }, onText: { [weak self] text in
                         guard let self, self.selectedID == id, self.captureRun == run else { return }
-                        self.sttStatus = "STT 수신 중"
+                        self.liveSTT.clear(sourceTag: micSourceTag)
+                        if self.sttStatus != "STT 수신 중" { self.sttStatus = "STT 수신 중" }
                         if self.includeSystemAudio { self.receiveDuplex(source: "마이크", text: text, prefix: prefix) }
                         else { self.updateText([prefix, text].filter { !$0.isEmpty }.joined(separator: "\n")) }
+                    }, onInterim: { [weak self] interim in
+                        guard let self, self.selectedID == id, self.captureRun == run else { return }
+                        self.liveSTT.update(text: interim, sourceTag: micSourceTag)
                     }, onError: { [weak self] error in
                         guard let self, self.captureRun == run else { return }
                         self.stop(); self.message = error
@@ -185,36 +252,71 @@ extension AppModel {
                 systemAudio.onLevel = { [weak self] level in Task { @MainActor in
                     guard let self, self.captureRun == run else { return }
                     self.audioLevelMonitor.level = level
-                    UserDefaults.standard.set(level, forKey: "systemAudioDiagnosticLevel")
                 } }
-                if settings.stt == .managed {
-                    try await managedSystem.start(language: language, externalAudio: true, inputDeviceUID: "", key: managedModels.authorization(.stt), onText: { [weak self] text in
+                if effectiveSTT == .parakeet {
+                    try await parakeetSystem.start(
+                        modelManager: parakeetModels,
+                        externalAudio: true,
+                        inputDeviceUID: "",
+                        interimInterval: sttTier.whisperStreamingInterval ?? 0.28,
+                        onText: { [weak self] text in
+                            guard let self, self.captureRun == run else { return }
+                            self.liveSTT.clear(sourceTag: "Mac 재생음")
+                            self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
+                        },
+                        onInterim: { [weak self] interim in
+                            guard let self, self.captureRun == run else { return }
+                            self.liveSTT.update(text: interim, sourceTag: "Mac 재생음")
+                        },
+                        onError: { [weak self] error in
+                            guard let self, self.captureRun == run else { return }; self.handleCaptureFailure(error)
+                        },
+                        onLatency: { _ in }
+                    )
+                } else if effectiveSTT == .managed {
+                    let allowLock = autoLanguagePrefs.mode == .singleLanguageFast
+                    try await managedSystem.start(language: language, externalAudio: true, inputDeviceUID: "", key: managedModels.authorization(.stt), interimInterval: sttTier.whisperStreamingInterval, allowWarmLanguageLock: allowLock, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
+                        self.liveSTT.clear(sourceTag: "Mac 재생음")
                         self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
+                    }, onInterim: { [weak self] interim in
+                        guard let self, self.captureRun == run else { return }
+                        self.liveSTT.update(text: interim, sourceTag: "Mac 재생음")
                     }, onError: { [weak self] error in
                         guard let self, self.captureRun == run else { return }; self.handleCaptureFailure(error)
-                    }, onLatency: { [weak self] ms in self?.managedModels.record(.stt, latency: ms) })
+                    }, onLatency: { [weak self] ms in self?.managedModels.record(.stt, latency: ms) }, onDetectedLanguage: { [weak self] detected in
+                        guard let self, self.captureRun == run else { return }
+                        self.recordDetectedLanguage(detected)
+                    })
                 } else {
-                    let appleLocale = language == LanguageCatalog.autoCode ? "en-US" : language
+                    let appleLocale = language == LanguageCatalog.autoCode
+                        ? (LanguageCatalog.language(for: lastFixedLanguage)?.code ?? "en-US")
+                        : language
                     try await systemSpeech.start(locale: appleLocale, externalAudio: true, inputDeviceUID: "", onTurns: { _ in }, onSTTStatus: { [weak self] status in
                         guard let self, self.captureRun == run else { return }
-                        if self.systemAudioOnly { self.sttStatus = status }
+                        if self.systemAudioOnly && self.sttStatus != status { self.sttStatus = status }
                     }, onSpeakerStatus: { _ in }, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
+                        self.liveSTT.clear(sourceTag: "Mac 재생음")
                         self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
-                        UserDefaults.standard.set(text.count, forKey: "systemAudioDiagnosticSTTCharacters")
+                    }, onInterim: { [weak self] interim in
+                        guard let self, self.captureRun == run else { return }
+                        self.liveSTT.update(text: interim, sourceTag: "Mac 재생음")
                     }, onError: { [weak self] error in
                         guard let self, self.captureRun == run else { return }
                         self.stop(); self.message = error
                     })
                 }
-                let useManagedSystemSTT = settings.stt == .managed
+                let useParakeetSystemSTT = effectiveSTT == .parakeet
+                let useManagedSystemSTT = effectiveSTT == .managed
+                let parakeetSystemCapture = parakeetSystem
                 let managedSystemCapture = managedSystem
                 let appleSystemCapture = systemSpeech
                 // Deliver system audio buffers directly on ScreenCaptureKit's serial queue to keep strict FIFO ordering.
                 systemAudio.onBuffer = { buffer in
                     if shouldRecord { recorder.append(buffer, source: .system) }
-                    if useManagedSystemSTT { managedSystemCapture.appendExternalAudio(buffer) }
+                    if useParakeetSystemSTT { parakeetSystemCapture.appendExternalAudio(buffer) }
+                    else if useManagedSystemSTT { managedSystemCapture.appendExternalAudio(buffer) }
                     else { appleSystemCapture.appendExternalAudio(buffer) }
                 }
                 systemAudio.onError = { [weak self] error in Task { @MainActor in
@@ -224,9 +326,13 @@ extension AppModel {
                 } }
                 do { try await systemAudio.start(target: meetingTarget) }
                 catch { throw CaptureError.message("상대방 재생음 수집을 시작하지 못했습니다. 시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 기록에서 SpikDoum을 허용해주세요. \(error.localizedDescription)") }
-                speakerStatus = settings.stt == .managed ? "자체 Whisper · 무음 경계/최대 3초 묶음 · 입력 경로 구분 (화자 분리 미지원)" : systemAudioOnly ? "Mac 재생음 전용 · Apple 음성 인식" : "마이크 + Mac 재생음 · 대괄호는 입력 경로이며 실제 화자 구분과 다릅니다"
+                speakerStatus = effectiveSTT == .parakeet ? "Parakeet TDT v3 · Apple Neural Engine 초저지연 스트리밍" : effectiveSTT == .managed ? "자체 Whisper · 실시간 슬라이딩 스트리밍 · 입력 경로 구분" : systemAudioOnly ? "Mac 재생음 전용 · Apple 음성 인식" : "마이크 + Mac 재생음 · 대괄호는 입력 경로이며 실제 화자 구분과 다릅니다"
             }
-            sttStatus = settings.stt == .managed ? "자체 STT 연결됨 · 음성 묶음 대기" : systemAudioOnly ? "Mac 소리 전용 · 영어/선택 언어 인식 대기" : settings.stt == .deepgram ? "클라우드 연결됨 · 음성 대기" : "마이크 연결됨 · 음성 대기"
+            sttStatus = effectiveSTT == .parakeet ? "Parakeet ANE 연결됨 · 초저지연 대기" : effectiveSTT == .managed ? "자체 STT 연결됨 · 실시간 스트리밍 대기" : systemAudioOnly ? "Mac 소리 전용 · 영어/선택 언어 인식 대기" : effectiveSTT == .deepgram ? "클라우드 연결됨 · 음성 대기" : "마이크 연결됨 · 음성 대기"
+            applyMicMuteState()
+            if micMuted && !systemAudioOnly {
+                sttStatus = includeSystemAudio ? "내 마이크 음소거 · Mac 재생음 수신 중" : "내 마이크 음소거됨"
+            }
             listeningStartedAt = Date()
             listening = true
             summaryTask = Task { [weak self] in
@@ -248,6 +354,7 @@ extension AppModel {
             }
         } catch {
             _ = audioRecorder.stopAndFinalize(); recordingConversationID = nil
+            parakeetMic.stop(); parakeetSystem.stop()
             managedMic.stop(); managedSystem.stop(); systemAudio.stop(); systemSpeech.stop(); capture.stop(); cloudCapture.stop()
             sttStatus = "시작 실패"; message = error.localizedDescription
             UserDefaults.standard.set(error.localizedDescription, forKey: "systemAudioDiagnosticError")
@@ -259,10 +366,12 @@ extension AppModel {
             liveCaptureRestartTask = nil
         }
         finishingCapture = false
+        parakeetMic.stop(); parakeetSystem.stop()
         managedMic.stop(); managedSystem.stop()
         keywordToken = UUID()
         captureRun = UUID()
         systemAudio.stop(); systemSpeech.stop(); cloudCapture.stop()
+        liveSTT.clear()
         finalizeAudioRecording()
         stableCloudTranscript = nil
         sttStatus = "듣기 중지"

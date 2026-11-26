@@ -59,8 +59,8 @@ struct EngineSettingsView: View {
                     Text("모델 다운로드 후 적용하면 별도 설치 없이 이 Mac에서 서버를 실행합니다.").font(.caption).foregroundStyle(.secondary)
                 }
                 Section("듣기 · 장치 · 추천 설정") { CaptureOptionsView(model: model) }
-                Section("번역 옆 키워드 · 대화 코치") {
-                    Toggle("키워드를 번역 패널에 함께 표시", isOn: $model.showTranslationKeywords)
+                Section("핵심 키워드 · 대화 코치") {
+                    Toggle("키워드를 대화 요약 하단에 표시", isOn: $model.showTranslationKeywords)
                     Toggle("자동 답변 · 조언", isOn: $model.autoAdvice)
                     Toggle("대화 코치 2개 언어 동시 출력 (STT 언어 + 번역 언어)", isOn: $model.bilingualCoach)
                 }
@@ -76,6 +76,7 @@ struct EngineSettingsView: View {
                 Section("음성 인식 · 화자 구분") {
                     Picker("STT", selection: $model.settings.stt) {
                         Text("Apple 음성 인식").tag(STTEngine.apple)
+                        Text("Parakeet TDT v3 · Apple ANE 초저지연 (영어·유럽어)").tag(STTEngine.parakeet)
                         Text("Deepgram Nova-3 · 다국어 · 화자 구분").tag(STTEngine.deepgram)
                         Text("자체 모델 · Whisper 서버").tag(STTEngine.managed)
                     }
@@ -95,11 +96,32 @@ struct EngineSettingsView: View {
                     }
                     if model.settings.translation == .local { LocalTranslationControls(model: model, key: $localTranslationKey) }
                 }
-                Section("답변 · 조언 · 전체/화자별 요약") {
-                    Picker("LLM", selection: $model.settings.llm) {
+                Section("답변 · 조언 · 요약 · 키워드 LLM") {
+                    Picker("메인 LLM (대화 코치 · 기본)", selection: $model.settings.llm) {
                         Text("Apple Intelligence · 기기 내").tag(LLMEngine.apple)
+                        Text("자체 로컬 LLM · 기기 내 (Qwen3 · Gemma)").tag(LLMEngine.managed)
                         Text("OpenAI API").tag(LLMEngine.openAI)
                         Text("로컬 / 내부망 · OpenAI 호환 서버").tag(LLMEngine.compatible)
+                    }
+                    if model.settings.llm == .managed {
+                        let installedLLMs = model.managedModels.models(for: .llm).filter { model.managedModels.installed.contains($0.id) }
+                        if installedLLMs.isEmpty {
+                            HStack {
+                                Text("설치된 로컬 LLM(.gguf) 모델이 없습니다.").font(.caption).foregroundStyle(.orange)
+                                Spacer()
+                                Button("모델 다운로드…") { showingModels = true }.controlSize(.small)
+                            }
+                        } else {
+                            Picker("자체 로컬 LLM 모델", selection: Binding(
+                                get: { model.managedModels.selectedLLM },
+                                set: { id in Task { await model.switchLLMEngine(.managed, managedModelID: id, announce: false) } }
+                            )) {
+                                ForEach(installedLLMs) { item in
+                                    Text("\(item.name) (\(item.sizeLabel))").tag(item.id)
+                                }
+                            }
+                            Text("전용 로컬 llama-server (8K 컨텍스트 · 병렬 2슬롯)로 외부 Ollama 없이 실행합니다. Apple 번역(~30ms)과 함께 쓰면 GPU 경합 없이 최고 속도로 동작합니다.").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     if model.settings.llm == .openAI {
                         SecureField("OpenAI API 키", text: $openAIKey)
@@ -116,7 +138,17 @@ struct EngineSettingsView: View {
                         SecureField("서버 API 키 (인증 없는 서버는 비워두세요)", text: $localKey)
                         Text("OpenAI 호환 /chat/completions 스트리밍을 지원해야 합니다. 내부망 서버에서는 수신 주소와 방화벽도 확인하세요.").font(.caption).foregroundStyle(.secondary)
                     }
-                    Text("선택한 서버로 대화 텍스트와 대화 목표를 전송합니다. 모델명은 해당 서버에서 제공하는 이름을 입력하세요.").font(.caption).foregroundStyle(.secondary)
+                    Picker("키워드 추출 엔진 (선택 분리)", selection: $model.settings.keywordLLM) {
+                        ForEach(LLMTaskOverride.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    Picker("대화 요약 · 스크립트 엔진 (선택 분리)", selection: $model.settings.summaryLLM) {
+                        ForEach(LLMTaskOverride.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    Text("키워드만 경량 엔진(Apple AI)으로 분리하거나, 모든 분석을 하나의 로컬/클라우드 LLM으로 통합해 실행할 수 있습니다.").font(.caption).foregroundStyle(.secondary)
                 }
             }.formStyle(.grouped)
             if let status { Text(status).font(.caption).textSelection(.enabled) }
@@ -146,8 +178,13 @@ struct EngineSettingsView: View {
         defer { testing = false }
         do {
             let started = Date()
-            let client = LLMClient(settings: model.settings, key: model.settings.llm == .openAI ? openAIKey : localKey)
-            let response = try await client.generate(instructions: "Reply with OK only.", input: "Connection test")
+            let response: String
+            if model.settings.llm == .managed {
+                response = try await model.managedModels.generateLLM(instructions: "Reply with OK only.", input: "Connection test", maxTokens: 32)
+            } else {
+                let client = LLMClient(settings: model.settings, key: model.settings.llm == .openAI ? openAIKey : localKey)
+                response = try await client.generate(instructions: "Reply with OK only.", input: "Connection test")
+            }
             status = "연결 성공 · \(Int(Date().timeIntervalSince(started) * 1000))ms · \(response.prefix(80))"
         } catch { status = error.localizedDescription }
     }
