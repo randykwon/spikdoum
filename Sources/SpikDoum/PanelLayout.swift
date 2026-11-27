@@ -38,39 +38,53 @@ enum HideablePanel: String, CaseIterable, Codable, Identifiable, Hashable, Senda
     var id: String { rawValue }
 }
 
+enum LinkedPanelKind: String, CaseIterable, Codable, Identifiable, Equatable, Hashable, Sendable {
+    case main
+    case coach
+    case summary
+
+    var id: String { rawValue }
+}
+
 struct PanelLayout: Codable, Equatable, Sendable {
     static let storageKey = "panelLayoutOrderV1"
     static let defaultOrder: [WorkspacePanelKind] = [.stt, .translation, .coach, .summaryScript]
+    static let defaultLinkedOrder: [LinkedPanelKind] = [.main, .coach, .summary]
 
     var splitOrder: [WorkspacePanelKind] = defaultOrder
     var linkedSummaryOnLeft: Bool = false
+    var linkedOrder: [LinkedPanelKind] = defaultLinkedOrder
     var summaryScriptReversed: Bool = false
     var hiddenPanels: Set<HideablePanel> = []
 
     init(
         splitOrder: [WorkspacePanelKind] = defaultOrder,
         linkedSummaryOnLeft: Bool = false,
+        linkedOrder: [LinkedPanelKind]? = nil,
         summaryScriptReversed: Bool = false,
         hiddenPanels: Set<HideablePanel> = []
     ) {
         self.splitOrder = Self.normalized(splitOrder)
         self.linkedSummaryOnLeft = linkedSummaryOnLeft
+        let fallbackLinked: [LinkedPanelKind] = linkedSummaryOnLeft ? [.summary, .main, .coach] : Self.defaultLinkedOrder
+        self.linkedOrder = Self.normalizedLinked(linkedOrder ?? fallbackLinked)
         self.summaryScriptReversed = summaryScriptReversed
         self.hiddenPanels = hiddenPanels
         ensureAtLeastOneMainPanelVisible()
     }
 
     private enum CodingKeys: String, CodingKey {
-        case splitOrder, linkedSummaryOnLeft, summaryScriptReversed, hiddenPanels
+        case splitOrder, linkedSummaryOnLeft, linkedOrder, summaryScriptReversed, hiddenPanels
     }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let order = try values.decodeIfPresent([WorkspacePanelKind].self, forKey: .splitOrder) ?? Self.defaultOrder
         let linkedLeft = try values.decodeIfPresent(Bool.self, forKey: .linkedSummaryOnLeft) ?? false
+        let decodedLinked = try values.decodeIfPresent([LinkedPanelKind].self, forKey: .linkedOrder)
         let reversed = try values.decodeIfPresent(Bool.self, forKey: .summaryScriptReversed) ?? false
         let hidden = try values.decodeIfPresent(Set<HideablePanel>.self, forKey: .hiddenPanels) ?? []
-        self.init(splitOrder: order, linkedSummaryOnLeft: linkedLeft, summaryScriptReversed: reversed, hiddenPanels: hidden)
+        self.init(splitOrder: order, linkedSummaryOnLeft: linkedLeft, linkedOrder: decodedLinked, summaryScriptReversed: reversed, hiddenPanels: hidden)
     }
 
     static func normalized(_ order: [WorkspacePanelKind]) -> [WorkspacePanelKind] {
@@ -79,6 +93,17 @@ struct PanelLayout: Codable, Equatable, Sendable {
             result.append(panel)
         }
         for panel in defaultOrder where !result.contains(panel) {
+            result.append(panel)
+        }
+        return result
+    }
+
+    static func normalizedLinked(_ order: [LinkedPanelKind]) -> [LinkedPanelKind] {
+        var result: [LinkedPanelKind] = []
+        for panel in order where !result.contains(panel) {
+            result.append(panel)
+        }
+        for panel in defaultLinkedOrder where !result.contains(panel) {
             result.append(panel)
         }
         return result
@@ -166,8 +191,54 @@ struct PanelLayout: Codable, Equatable, Sendable {
         splitOrder.insert(item, at: toIndex)
     }
 
+    func visibleLinkedPanels(includeCoach: Bool, includeSummary: Bool) -> [LinkedPanelKind] {
+        Self.normalizedLinked(linkedOrder).filter { panel in
+            switch panel {
+            case .main: return true
+            case .coach: return includeCoach && isVisible(.coach)
+            case .summary: return includeSummary
+            }
+        }
+    }
+
+    mutating func moveLinked(_ panel: LinkedPanelKind, by delta: Int, includeCoach: Bool, includeSummary: Bool) {
+        linkedOrder = Self.normalizedLinked(linkedOrder)
+        let visible = visibleLinkedPanels(includeCoach: includeCoach, includeSummary: includeSummary)
+        guard let visibleIndex = visible.firstIndex(of: panel) else { return }
+        let targetVisibleIndex = visibleIndex + delta
+        guard targetVisibleIndex >= 0, targetVisibleIndex < visible.count else { return }
+        let neighbor = visible[targetVisibleIndex]
+        guard let fromIndex = linkedOrder.firstIndex(of: panel),
+              let toIndex = linkedOrder.firstIndex(of: neighbor) else { return }
+        linkedOrder.swapAt(fromIndex, toIndex)
+        syncLinkedSummarySideFlag()
+    }
+
+    mutating func moveLinked(_ source: LinkedPanelKind, to target: LinkedPanelKind) {
+        guard source != target else { return }
+        linkedOrder = Self.normalizedLinked(linkedOrder)
+        guard let fromIndex = linkedOrder.firstIndex(of: source),
+              let toIndex = linkedOrder.firstIndex(of: target) else { return }
+        let item = linkedOrder.remove(at: fromIndex)
+        linkedOrder.insert(item, at: toIndex)
+        syncLinkedSummarySideFlag()
+    }
+
+    private mutating func syncLinkedSummarySideFlag() {
+        if let summaryIdx = linkedOrder.firstIndex(of: .summary),
+           let mainIdx = linkedOrder.firstIndex(of: .main) {
+            linkedSummaryOnLeft = summaryIdx < mainIdx
+        }
+    }
+
     mutating func swapLinkedSide() {
         linkedSummaryOnLeft.toggle()
+        linkedOrder = Self.normalizedLinked(linkedOrder)
+        if let summaryIdx = linkedOrder.firstIndex(of: .summary),
+           let mainIdx = linkedOrder.firstIndex(of: .main),
+           (summaryIdx < mainIdx) != linkedSummaryOnLeft {
+            linkedOrder.swapAt(summaryIdx, mainIdx)
+        }
     }
 
     mutating func toggleSummaryScriptOrder() {
@@ -177,6 +248,7 @@ struct PanelLayout: Codable, Equatable, Sendable {
     mutating func reset() {
         splitOrder = Self.defaultOrder
         linkedSummaryOnLeft = false
+        linkedOrder = Self.defaultLinkedOrder
         summaryScriptReversed = false
         hiddenPanels = []
     }

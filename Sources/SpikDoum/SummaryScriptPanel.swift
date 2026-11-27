@@ -452,9 +452,12 @@ struct SummaryScriptPanel: View {
                     }
                     .padding(4)
                 }
-                .readingScrollControl(model)
                 .onChange(of: model.displayConversation?.transcript) { _, _ in
-                    if model.followLive { proxy.scrollTo("script-bottom", anchor: .bottom) }
+                    if model.followLive {
+                        var t = Transaction()
+                        t.disablesAnimations = true
+                        withTransaction(t) { proxy.scrollTo("script-bottom", anchor: .bottom) }
+                    }
                 }
                 .onChange(of: model.displayConversation?.translations?.count) { _, _ in
                     if model.followLive { proxy.scrollTo("script-bottom", anchor: .bottom) }

@@ -105,6 +105,7 @@ final class ParakeetSpeechCapture {
     private var pending: [Data] = []
     private var worker: Task<Void, Never>?
     private var interimTask: Task<Void, Never>?
+    private var interimTaskID = UUID()
     private var agreement = LocalAgreementTracker()
     private var generation = UUID()
     private var active = false
@@ -205,8 +206,16 @@ final class ParakeetSpeechCapture {
 
     private func runInterim(_ pcm: Data, token: UUID) {
         guard interimTask == nil, pending.isEmpty, worker == nil, let mgr = modelManager else { return }
+        let taskID = UUID()
+        interimTaskID = taskID
         interimTask = Task { [weak self] in
-            defer { Task { @MainActor in self?.interimTask = nil } }
+            defer {
+                Task { @MainActor in
+                    if let self, self.interimTaskID == taskID {
+                        self.interimTask = nil
+                    }
+                }
+            }
             let started = Date()
             do {
                 let raw = try await mgr.transcribe(pcm16Data: pcm)
@@ -231,6 +240,7 @@ final class ParakeetSpeechCapture {
     private func enqueue(_ pcm: Data) {
         interimTask?.cancel()
         interimTask = nil
+        interimTaskID = UUID()
         if pending.count >= 24 { pending.removeFirst() }
         pending.append(pcm)
         if worker == nil { runWorker() }
@@ -258,13 +268,15 @@ final class ParakeetSpeechCapture {
                     self.onLatency?(Int(Date().timeIntervalSince(started) * 1000))
                     self.interimText = ""
                     self.agreement.reset()
-                    self.onInterimText?("")
                     if let cleaned = ManagedSTTPolicy.sanitize(raw, previousChunk: self.lastCleanChunk) {
                         self.lastCleanChunk = cleaned
                         self.text = [self.text, cleaned].filter { !$0.isEmpty }.joined(separator: "\n")
                         self.onText?(self.text)
-                    } else if self.onInterimText == nil && !self.text.isEmpty {
-                        self.onText?(self.text)
+                    } else {
+                        self.onInterimText?("")
+                        if self.onInterimText == nil && !self.text.isEmpty {
+                            self.onText?(self.text)
+                        }
                     }
                 } catch {
                     guard self.generation == token, !Task.isCancelled else { return }

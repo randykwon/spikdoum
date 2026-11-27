@@ -75,20 +75,35 @@ enum AppPerspective: String, CaseIterable, Identifiable, Codable, Sendable {
 struct WindowPrivacyController: NSViewRepresentable {
     let hideFromScreenShare: Bool
 
+    final class Coordinator {
+        var lastApplied: Bool?
+        weak var lastWindow: NSWindow?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        apply(to: view)
+        apply(to: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        apply(to: nsView)
+        if context.coordinator.lastApplied == hideFromScreenShare,
+           let window = nsView.window,
+           context.coordinator.lastWindow === window {
+            return
+        }
+        apply(to: nsView, coordinator: context.coordinator)
     }
 
-    private func apply(to view: NSView) {
+    private func apply(to view: NSView, coordinator: Coordinator) {
+        let hide = hideFromScreenShare
         DispatchQueue.main.async {
             guard let window = view.window else { return }
-            let desired: NSWindow.SharingType = hideFromScreenShare ? .none : .readOnly
+            coordinator.lastWindow = window
+            coordinator.lastApplied = hide
+            let desired: NSWindow.SharingType = hide ? .none : .readOnly
             if window.sharingType != desired {
                 window.sharingType = desired
             }

@@ -29,6 +29,13 @@ struct SpikDoumApp: App {
                 Toggle("내 마이크 음소거", isOn: $model.micMuted).keyboardShortcut("m", modifiers: [.command, .shift]).disabled(model.systemAudioOnly)
                 Toggle("심플 패스트 모드 (STT · 번역 전용)", isOn: $model.simpleFastMode).keyboardShortcut("f", modifiers: [.command, .shift])
                 Toggle("상단 패널 접기", isOn: $model.topHeaderCollapsed).keyboardShortcut("t", modifiers: [.command, .shift])
+                Toggle("대화 목록 마우스 자동 숨김", isOn: $model.sidebarAutoHide).keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("발표 질문기록 저장") { model.captureRecentQuestionAsPostIt() }
+                    .keyboardShortcut("q", modifiers: [.command, .option])
+                    .disabled(model.perspective != .presentation || model.current == nil || model.current?.archivedAt != nil)
+                Button("교육 창 조용히 캡처") { Task { await model.captureLearningScreenNow(automatic: false) } }
+                    .keyboardShortcut("s", modifiers: [.command, .option])
+                    .disabled(model.current == nil || model.current?.archivedAt != nil)
                 Toggle("화면 공유에서 창 숨기기", isOn: $model.hideFromScreenShare).keyboardShortcut("h", modifiers: [.command, .shift])
                 Divider()
                 Menu("퍼스펙티브 전환") {
@@ -86,16 +93,21 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
     @AppStorage("showSummaryScriptPanel") private var showSummaryScriptPanel = true
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var focusLayout: (summaryScript: Bool, columns: NavigationSplitViewVisibility)?
+    @AppStorage("showLearningCapturesPanelV1") private var showLearningCapturesPanel = true
+    @State private var sidebarHoverVisible = false
+    @FocusState private var sidebarSearchFocused: Bool
+    @State private var focusLayout: (summaryScript: Bool, sidebarAutoHide: Bool)?
     private var isFocused: Bool { focusLayout != nil }
     private func toggleFocus() {
         if let previous = focusLayout {
             showSummaryScriptPanel = previous.summaryScript
-            columnVisibility = previous.columns; focusLayout = nil
+            model.sidebarAutoHide = previous.sidebarAutoHide
+            focusLayout = nil
         } else {
-            focusLayout = (showSummaryScriptPanel, columnVisibility)
-            showSummaryScriptPanel = false; columnVisibility = .detailOnly
+            focusLayout = (showSummaryScriptPanel, model.sidebarAutoHide)
+            showSummaryScriptPanel = false
+            model.sidebarAutoHide = true
+            sidebarHoverVisible = false
         }
     }
     @AppStorage("linkedConversationView") private var linkedConversationView = true
@@ -177,116 +189,135 @@ struct ContentView: View {
             SummaryScriptPanel(model: model)
         }
     }
-    var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("SpikDoum").font(.title2.bold())
+    private var conversationSidebarContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 6) {
+                Text("SpikDoum").font(.title2.bold())
+                Spacer()
+                PanelFontButton(title: "대화 목록", value: $model.panelTypography.sidebar, defaultValue: 14)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.sidebarAutoHide.toggle()
+                        if !model.sidebarAutoHide { sidebarHoverVisible = false }
+                    }
+                } label: {
+                    Image(systemName: model.sidebarAutoHide ? "pin" : "pin.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(model.sidebarAutoHide ? Color.secondary : Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help(model.sidebarAutoHide ? "사이드바 고정하기 (현재: 마우스 이동 시 자동 숨김 · ⇧⌘L)" : "사이드바 고정 해제 · 마우스 자동 숨김으로 전환 (⇧⌘L)")
+            }
+            Text(model.t("app.tagline")).font(.caption).foregroundStyle(.secondary)
+            Button(action: { showingArchive = false; model.newConversation(autoStart: true) }) { Label(model.t("action.newConversation"), systemImage: "plus") }.disabled(model.starting)
+            Toggle(model.t("action.autoListenOnNew"), isOn: $model.autoStartListeningOnNewConversation)
+                .font(.caption)
+                .help("새 대화 버튼 또는 ⌘N 실행 시 현재 듣기 설정으로 즉시 듣기를 시작합니다.")
+            Picker(model.t("tab.conversations"), selection: $showingArchive) {
+                Text(model.t("tab.conversations")).tag(false)
+                Text(model.t("tab.archive")).tag(true)
+            }.pickerStyle(.segmented)
+            .onChange(of: showingArchive) { _, _ in
+                selectedConversations = []
+                if visibleConversations.contains(where: { $0.id == model.selectedID }) { return }
+                if let first = visibleConversations.first { model.select(first.id) }
+                else { model.stop(); model.selectedID = nil }
+            }
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField(model.t("search.placeholder"), text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .focused($sidebarSearchFocused)
+                if !searchQuery.isEmpty {
+                    Button { searchQuery = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                        .buttonStyle(.plain)
+                }
+            }.font(.caption).padding(.horizontal, 8).padding(.vertical, 5)
+                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            HStack {
+                Button(selectingConversations ? model.t("select.done") : model.t("select.multi")) {
+                    selectingConversations.toggle(); selectedConversations = []
+                }.disabled(model.starting)
+                if selectingConversations {
                     Spacer()
-                    PanelFontButton(title: "대화 목록", value: $model.panelTypography.sidebar, defaultValue: 14)
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) { columnVisibility = .detailOnly }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("대화 목록 사이드바 숨기기")
+                    Button(visibleSelection.count == visibleConversations.count && !visibleConversations.isEmpty ? model.t("select.none") : model.t("select.all")) {
+                        selectedConversations = visibleSelection.count == visibleConversations.count ? [] : Set(visibleConversations.map(\.id))
+                    }.disabled(visibleConversations.isEmpty || model.starting)
                 }
-                Text(model.t("app.tagline")).foregroundStyle(.secondary)
-                Button(action: { showingArchive = false; model.newConversation(autoStart: true) }) { Label(model.t("action.newConversation"), systemImage: "plus") }.disabled(model.starting)
-                Toggle(model.t("action.autoListenOnNew"), isOn: $model.autoStartListeningOnNewConversation)
-                    .font(.caption)
-                    .help("새 대화 버튼 또는 ⌘N 실행 시 현재 듣기 설정으로 즉시 듣기를 시작합니다.")
-                Picker(model.t("tab.conversations"), selection: $showingArchive) {
-                    Text(model.t("tab.conversations")).tag(false)
-                    Text(model.t("tab.archive")).tag(true)
-                }.pickerStyle(.segmented)
-                .onChange(of: showingArchive) { _, _ in
-                    selectedConversations = []
-                    if visibleConversations.contains(where: { $0.id == model.selectedID }) { return }
-                    if let first = visibleConversations.first { model.select(first.id) }
-                    else { model.stop(); model.selectedID = nil }
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField(model.t("search.placeholder"), text: $searchQuery).textFieldStyle(.plain)
-                    if !searchQuery.isEmpty {
-                        Button { searchQuery = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                            .buttonStyle(.plain)
-                    }
-                }.font(.caption).padding(.horizontal, 8).padding(.vertical, 5)
-                    .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                HStack {
-                    Button(selectingConversations ? model.t("select.done") : model.t("select.multi")) {
-                        selectingConversations.toggle(); selectedConversations = []
-                    }.disabled(model.starting)
+            }.font(.caption)
+            List(visibleConversations) { item in
+                Button {
                     if selectingConversations {
-                        Spacer()
-                        Button(visibleSelection.count == visibleConversations.count && !visibleConversations.isEmpty ? model.t("select.none") : model.t("select.all")) {
-                            selectedConversations = visibleSelection.count == visibleConversations.count ? [] : Set(visibleConversations.map(\.id))
-                        }.disabled(visibleConversations.isEmpty || model.starting)
-                    }
-                }.font(.caption)
-                List(visibleConversations) { item in
-                    Button {
+                        if selectedConversations.contains(item.id) { selectedConversations.remove(item.id) }
+                        else { selectedConversations.insert(item.id) }
+                    } else { model.select(item.id) }
+                } label: {
+                    HStack(alignment: .top, spacing: 8) {
                         if selectingConversations {
-                            if selectedConversations.contains(item.id) { selectedConversations.remove(item.id) }
-                            else { selectedConversations.insert(item.id) }
-                        } else { model.select(item.id) }
-                    } label: {
-                        HStack(alignment: .top, spacing: 8) {
-                            if selectingConversations {
-                                Image(systemName: selectedConversations.contains(item.id) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(selectedConversations.contains(item.id) ? Color.accentColor : .secondary).padding(.top, 7)
-                            }
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(item.title).font(.system(size: model.panelTypography.sidebar)).lineLimit(2).foregroundStyle(model.selectedID == item.id ? Color.accentColor : .primary)
-                            if let preview = item.preview, !preview.isEmpty {
-                                Text(preview).font(.system(size: max(12, model.panelTypography.sidebar - 2))).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                            HStack(spacing: 4) {
-                                Text(item.date, format: .dateTime.month().day().hour().minute()).font(.caption).foregroundStyle(.secondary)
-                                if let clips = item.audioClips, !clips.isEmpty {
-                                    Image(systemName: "waveform").font(.caption2).foregroundStyle(.blue).help("음성 녹음 \(clips.count)개 포함")
-                                }
-                            }
-                        }.padding(.vertical, 5).frame(maxWidth: .infinity, alignment: .leading)
-                        }.contentShape(Rectangle())
-                    }.buttonStyle(.plain)
-                        .accessibilityLabel(selectingConversations ? "\(selectedConversations.contains(item.id) ? "선택됨" : "선택 안 됨") · \(item.title)" : item.title).disabled(model.starting)
-                        .contextMenu {
-                            Button("대화 다시 재생…") { model.openReplay(item.id) }
-                            Button("Markdown 내보내기…") {
-                                if let error = ConversationExport.saveWithPanel(item) { model.message = error }
-                            }
-                            Divider()
-                            if item.archivedAt != nil {
-                                Button("대화 복원") { model.restoreConversation(item.id); model.select(item.id); showingArchive = false }
-                                Button("완전 삭제…", role: .destructive) { pendingDeletion = [item.id] }
-                            } else {
-                                Button(model.deletionMode == .archive ? "아카이빙" : "완전 삭제…", role: model.deletionMode == .permanent ? .destructive : nil) { requestRemoval(item.id) }
+                            Image(systemName: selectedConversations.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(selectedConversations.contains(item.id) ? Color.accentColor : .secondary).padding(.top, 7)
+                        }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(item.title).font(.system(size: model.panelTypography.sidebar)).lineLimit(2).foregroundStyle(model.selectedID == item.id ? Color.accentColor : .primary)
+                        if let preview = item.preview, !preview.isEmpty {
+                            Text(preview).font(.system(size: max(12, model.panelTypography.sidebar - 2))).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                        HStack(spacing: 4) {
+                            Text(item.date, format: .dateTime.month().day().hour().minute()).font(.caption).foregroundStyle(.secondary)
+                            if let clips = item.audioClips, !clips.isEmpty {
+                                Image(systemName: "waveform").font(.caption2).foregroundStyle(.blue).help("음성 녹음 \(clips.count)개 포함")
                             }
                         }
-                }.listStyle(.plain)
-                if selectingConversations {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("\(visibleSelection.count)개 선택됨").font(.caption.bold())
-                        Button {
-                            if showingArchive { model.restoreConversations(visibleSelection) }
-                            else { model.archiveConversations(visibleSelection) }
-                            selectedConversations = []
-                        } label: { Label(showingArchive ? "선택 대화 복원" : "선택 대화 아카이브", systemImage: showingArchive ? "arrow.uturn.backward" : "archivebox") }
-                        .disabled(visibleSelection.isEmpty || model.starting)
-                        Button(role: .destructive) { pendingDeletion = visibleSelection } label: { Label("선택 대화 완전 삭제…", systemImage: "trash") }
-                            .disabled(visibleSelection.isEmpty || model.starting)
+                    }.padding(.vertical, 5).frame(maxWidth: .infinity, alignment: .leading)
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel(selectingConversations ? "\(selectedConversations.contains(item.id) ? "선택됨" : "선택 안 됨") · \(item.title)" : item.title).disabled(model.starting)
+                    .contextMenu {
+                        Button("대화 다시 재생…") { model.openReplay(item.id) }
+                        Button("Markdown 내보내기…") {
+                            if let error = ConversationExport.saveWithPanel(item) { model.message = error }
+                        }
+                        Divider()
+                        if item.archivedAt != nil {
+                            Button("대화 복원") { model.restoreConversation(item.id); model.select(item.id); showingArchive = false }
+                            Button("완전 삭제…", role: .destructive) { pendingDeletion = [item.id] }
+                        } else {
+                            Button(model.deletionMode == .archive ? "아카이빙" : "완전 삭제…", role: model.deletionMode == .permanent ? .destructive : nil) { requestRemoval(item.id) }
+                        }
                     }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            if selectingConversations {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("\(visibleSelection.count)개 선택됨").font(.caption.bold())
+                    Button {
+                        if showingArchive { model.restoreConversations(visibleSelection) }
+                        else { model.archiveConversations(visibleSelection) }
+                        selectedConversations = []
+                    } label: { Label(showingArchive ? "선택 대화 복원" : "선택 대화 아카이브", systemImage: showingArchive ? "arrow.uturn.backward" : "archivebox") }
+                    .disabled(visibleSelection.isEmpty || model.starting)
+                    Button(role: .destructive) { pendingDeletion = visibleSelection } label: { Label("선택 대화 완전 삭제…", systemImage: "trash") }
+                        .disabled(visibleSelection.isEmpty || model.starting)
                 }
-                Text(model.t("app.localStorageNotice")).font(.caption).foregroundStyle(.secondary)
-            }.padding().navigationSplitViewColumnWidth(220)
-        } detail: {
-            VStack(alignment: .leading, spacing: model.topHeaderCollapsed ? 5 : 8) {
+            }
+            Text(model.t("app.localStorageNotice")).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(width: SidebarAutoHidePolicy.defaultSidebarWidth)
+        .frame(maxHeight: .infinity)
+    }
+
+    var body: some View {
+        let sidebarIsBusy = sidebarSearchFocused || selectingConversations || !pendingDeletion.isEmpty
+        ZStack(alignment: .leading) {
+            HStack(spacing: 0) {
+                if !model.sidebarAutoHide {
+                    conversationSidebarContent
+                        .background(Color(nsColor: .windowBackgroundColor))
+                    Divider()
+                }
+                VStack(alignment: .leading, spacing: model.topHeaderCollapsed ? 5 : 8) {
                 if model.topHeaderCollapsed {
                     collapsedTopHeaderBar
                 } else {
@@ -304,6 +335,7 @@ struct ContentView: View {
                         Text(model.current?.title ?? model.t("action.newConversation")).font(.headline).lineLimit(1)
                         Label(model.sttStatus, systemImage: model.listening ? "waveform" : "mic")
                             .font(.caption).foregroundStyle(model.listening ? .green : .secondary)
+                            .lineLimit(1)
                     }
                     Spacer()
                     if let item = model.current {
@@ -389,18 +421,26 @@ struct ContentView: View {
                     } label: {
                         Label(model.t("panel.summaryScriptToggle"), systemImage: (showSummaryScriptPanel && model.panelLayout.hasAnySummaryScriptVisible) ? "sidebar.right" : "sidebar.squares.right")
                     }.labelStyle(.iconOnly).help(model.t("panel.summaryScriptToggle"))
-                    let anyPanelHidden = columnVisibility == .detailOnly
-                        || model.panelLayout.hasHiddenPanels
+                    let anyPanelHidden = model.panelLayout.hasHiddenPanels
                         || !showSummaryScriptPanel
                         || !model.showTranslationKeywords
                     Menu {
                         Section("패널 표시 / 숨기기") {
                             Button {
-                                withAnimation(.easeInOut(duration: 0.18)) {
-                                    columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    model.sidebarAutoHide.toggle()
+                                    if !model.sidebarAutoHide { sidebarHoverVisible = false }
                                 }
                             } label: {
-                                Label("대화 목록 (사이드바)", systemImage: columnVisibility == .detailOnly ? "circle" : "checkmark")
+                                Label("대화 목록 고정 표시", systemImage: model.sidebarAutoHide ? "circle" : "checkmark")
+                            }
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    model.sidebarAutoHide = true
+                                    sidebarHoverVisible = true
+                                }
+                            } label: {
+                                Label("대화 목록 마우스 자동 숨김 (⇧⌘L)", systemImage: model.sidebarAutoHide ? "checkmark" : "circle")
                             }
                             Button {
                                 withAnimation(.easeInOut(duration: 0.18)) {
@@ -470,7 +510,6 @@ struct ContentView: View {
                             Divider()
                             Button {
                                 withAnimation(.easeInOut(duration: 0.2)) {
-                                    columnVisibility = .all
                                     showSummaryScriptPanel = true
                                     model.showTranslationKeywords = true
                                     model.panelLayout.showAllPanels()
@@ -491,7 +530,6 @@ struct ContentView: View {
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 showSummaryScriptPanel = true
                                 model.showTranslationKeywords = true
-                                columnVisibility = .all
                                 model.panelLayout.reset()
                             }
                         }
@@ -558,55 +596,22 @@ struct ContentView: View {
                             .lineLimit(1)
                     }
                 }
+                .frame(height: 24)
                 }
                 if (model.includeSystemAudio || model.systemAudioOnly) && !model.systemAudioPermissionGranted {
                     HStack {
                         Label("시스템 오디오 권한이 필요합니다", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                         Link("권한 설정 열기", destination: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                    }.font(.caption)
-                }
-                if let error = model.message {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
-                        Text(error).foregroundStyle(.red).textSelection(.enabled)
-                        Spacer(minLength: 4)
-                        Button { model.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                }
-                if let error = model.deviceError {
-                    HStack(spacing: 8) {
-                        Image(systemName: "mic.slash.fill").foregroundStyle(.orange)
-                        Text(error).foregroundStyle(.orange)
-                        Spacer(minLength: 4)
-                        Button("기본 마이크 사용") { model.useDefaultInputDevice() }.controlSize(.mini)
-                        Button(model.t("settings.captureTitle")) { showingCaptureSettings = true }.controlSize(.mini)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                    }.font(.caption).lineLimit(1)
                 }
                 if !model.topHeaderCollapsed {
-                if let notice = model.presetNotice {
-                    HStack(spacing: 8) {
-                        Image(systemName: "info.circle.fill").foregroundStyle(.blue)
-                        Text(notice).foregroundStyle(.blue)
-                        Spacer(minLength: 4)
-                        Button { model.presetNotice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                }
                 if model.settings.usesAppleLLMForAnyTask, let status = model.modelStatus {
                     DisclosureGroup("Apple Intelligence 안내") {
                         Text(status).foregroundStyle(.orange)
                     }.font(.caption)
                 }
                 HStack(spacing: 10) {
-                    Label(model.t("live.header"), systemImage: "waveform.circle.fill").font(.headline).foregroundStyle(.blue)
+                    Label(model.t("live.header"), systemImage: "waveform.circle.fill").font(.headline).foregroundStyle(.blue).lineLimit(1).fixedSize(horizontal: true, vertical: false)
                     Picker("범위", selection: $model.recentSeconds) {
                         Text(model.t("range.all")).tag(0)
                         Text(model.t("range.2min")).tag(120)
@@ -744,39 +749,47 @@ struct ContentView: View {
                     }
                     Spacer()
                     if !model.followLive {
-                        Text(model.hasUnreadLiveChanges ? model.t("reading.pausedReceiving") : model.t("reading.paused")).font(.caption.bold()).foregroundStyle(.orange)
+                        Text(model.hasUnreadLiveChanges ? model.t("reading.pausedReceiving") : model.t("reading.paused")).font(.caption.bold()).foregroundStyle(.orange).lineLimit(1)
                     }
                     Button {
                         if model.followLive { model.pauseReading() } else { model.resumeReading() }
-                    } label: { Label(model.followLive ? model.t("reading.pause") : model.t("reading.resume"), systemImage: model.followLive ? "pause.circle" : "arrow.down.to.line") }
-                }.controlSize(.small)
+                    } label: { Label(model.followLive ? model.t("reading.pause") : model.t("reading.resume"), systemImage: model.followLive ? "pause.circle" : "arrow.down.to.line").lineLimit(1) }
+                        .fixedSize()
+                }.controlSize(.small).frame(height: 26)
+                }
+                if model.perspective == .learning {
+                    LearningCaptureToolbar(model: model, showCapturesPanel: $showLearningCapturesPanel)
                 }
                 let effectiveShowSummary = !model.simpleFastMode && showSummaryScriptPanel && (model.panelLayout.hasAnySummaryScriptVisible || model.showTranslationKeywords)
+                let effectiveShowLinkedCoach = !model.simpleFastMode && model.panelLayout.isVisible(.coach)
                 if model.perspective == .presentation {
                     PresentationWorkspaceView(model: model)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if linkedConversationView {
-                    let linkedSides: [String] = effectiveShowSummary
-                        ? (model.panelLayout.linkedSummaryOnLeft ? ["linked-summary", "linked-main"] : ["linked-main", "linked-summary"])
-                        : ["linked-main"]
+                    let linkedPanels = model.panelLayout.visibleLinkedPanels(
+                        includeCoach: effectiveShowLinkedCoach,
+                        includeSummary: effectiveShowSummary
+                    )
                     HSplitView {
-                        ForEach(Array(linkedSides.enumerated()), id: \.element) { index, side in
+                        ForEach(Array(linkedPanels.enumerated()), id: \.element) { index, side in
                             let isFirst = index == 0
-                            let isLast = index == linkedSides.count - 1
-                            if side == "linked-summary" {
+                            let isLast = index == linkedPanels.count - 1
+                            let dragID = "linked-\(side.rawValue)"
+                            switch side {
+                            case .summary:
                                 VStack(alignment: .leading, spacing: model.topHeaderCollapsed ? 4 : 6) {
                                     if !model.topHeaderCollapsed {
                                         PanelReorderBar(
                                             title: model.t("panel.summaryScriptToggle"),
                                             icon: "doc.text",
-                                            dragPayload: side,
+                                            dragPayload: dragID,
                                             canMoveLeft: !isFirst,
                                             canMoveRight: !isLast,
                                             moveLeftHelp: model.t("panel.moveLeft"),
                                             moveRightHelp: model.t("panel.moveRight"),
                                             dragHelp: model.t("panel.dragHint"),
-                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
-                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
+                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: -1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } },
+                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: 1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } },
                                             extraActionIcon: (model.panelLayout.isVisible(.summary) && model.panelLayout.isVisible(.script)) ? "arrow.up.arrow.down" : nil,
                                             extraActionHelp: model.t("panel.swapVertical"),
                                             onExtraAction: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.toggleSummaryScriptOrder() } },
@@ -786,49 +799,91 @@ struct ContentView: View {
                                     }
                                     SummaryScriptPanel(model: model)
                                 }
-                                .frame(minWidth: 300, idealWidth: 380)
+                                .frame(minWidth: 280, idealWidth: 360)
                                 .padding(.leading, isFirst ? 0 : 10)
                                 .padding(.trailing, isLast ? 0 : 10)
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == side ? 2 : 0))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == dragID ? 2 : 0))
                                 .dropDestination(for: String.self) { items, _ in
                                     dropTargetPanel = nil
-                                    guard let dragged = items.first, dragged != side, dragged.hasPrefix("linked-") else { return false }
-                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() }
+                                    guard let dragged = items.first, dragged != dragID, dragged.hasPrefix("linked-"),
+                                          let sourceKind = LinkedPanelKind(rawValue: String(dragged.dropFirst("linked-".count))) else { return false }
+                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(sourceKind, to: side) }
                                     return true
                                 } isTargeted: { targeted in
-                                    dropTargetPanel = targeted ? side : (dropTargetPanel == side ? nil : dropTargetPanel)
+                                    dropTargetPanel = targeted ? dragID : (dropTargetPanel == dragID ? nil : dropTargetPanel)
                                 }
-                            } else {
+                            case .coach:
                                 VStack(alignment: .leading, spacing: model.topHeaderCollapsed ? 4 : 6) {
-                                    if effectiveShowSummary && !model.topHeaderCollapsed {
+                                    if !model.topHeaderCollapsed {
                                         PanelReorderBar(
-                                            title: model.t("view.linked"),
-                                            icon: "rectangle.split.2x1",
-                                            dragPayload: side,
+                                            title: model.t("panel.coach"),
+                                            icon: "sparkles",
+                                            dragPayload: dragID,
                                             canMoveLeft: !isFirst,
                                             canMoveRight: !isLast,
                                             moveLeftHelp: model.t("panel.moveLeft"),
                                             moveRightHelp: model.t("panel.moveRight"),
                                             dragHelp: model.t("panel.dragHint"),
-                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } },
-                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() } }
+                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: -1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } },
+                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: 1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } },
+                                            hideHelp: "대화 코치 패널 숨기기",
+                                            onHide: { withAnimation(.easeInOut(duration: 0.18)) { model.panelLayout.setVisible(.coach, false, includeCoach: true) } }
                                         )
                                     }
-                                    LinkedConversationView(model: model)
+                                    CoachView(model: model, pausesLiveReadingOnScroll: false)
                                 }
-                                .frame(minWidth: 540, minHeight: 300)
+                                .frame(minWidth: 270, idealWidth: 340)
                                 .padding(.leading, isFirst ? 0 : 10)
                                 .padding(.trailing, isLast ? 0 : 10)
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == side ? 2 : 0))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == dragID ? 2 : 0))
                                 .dropDestination(for: String.self) { items, _ in
                                     dropTargetPanel = nil
-                                    guard let dragged = items.first, dragged != side, dragged.hasPrefix("linked-") else { return false }
-                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.swapLinkedSide() }
+                                    guard let dragged = items.first, dragged != dragID, dragged.hasPrefix("linked-"),
+                                          let sourceKind = LinkedPanelKind(rawValue: String(dragged.dropFirst("linked-".count))) else { return false }
+                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(sourceKind, to: side) }
                                     return true
                                 } isTargeted: { targeted in
-                                    dropTargetPanel = targeted ? side : (dropTargetPanel == side ? nil : dropTargetPanel)
+                                    dropTargetPanel = targeted ? dragID : (dropTargetPanel == dragID ? nil : dropTargetPanel)
+                                }
+                            case .main:
+                                VStack(alignment: .leading, spacing: model.topHeaderCollapsed ? 4 : 6) {
+                                    if linkedPanels.count > 1 && !model.topHeaderCollapsed {
+                                        PanelReorderBar(
+                                            title: model.t("view.linked"),
+                                            icon: "rectangle.split.2x1",
+                                            dragPayload: dragID,
+                                            canMoveLeft: !isFirst,
+                                            canMoveRight: !isLast,
+                                            moveLeftHelp: model.t("panel.moveLeft"),
+                                            moveRightHelp: model.t("panel.moveRight"),
+                                            dragHelp: model.t("panel.dragHint"),
+                                            onMoveLeft: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: -1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } },
+                                            onMoveRight: { withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(side, by: 1, includeCoach: effectiveShowLinkedCoach, includeSummary: effectiveShowSummary) } }
+                                        )
+                                    }
+                                    LinkedConversationView(model: model, coachInSeparatePanel: true)
+                                }
+                                .frame(minWidth: 420, minHeight: 300)
+                                .padding(.leading, isFirst ? 0 : 10)
+                                .padding(.trailing, isLast ? 0 : 10)
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: dropTargetPanel == dragID ? 2 : 0))
+                                .dropDestination(for: String.self) { items, _ in
+                                    dropTargetPanel = nil
+                                    guard let dragged = items.first, dragged != dragID, dragged.hasPrefix("linked-"),
+                                          let sourceKind = LinkedPanelKind(rawValue: String(dragged.dropFirst("linked-".count))) else { return false }
+                                    withAnimation(.easeInOut(duration: 0.2)) { model.panelLayout.moveLinked(sourceKind, to: side) }
+                                    return true
+                                } isTargeted: { targeted in
+                                    dropTargetPanel = targeted ? dragID : (dropTargetPanel == dragID ? nil : dropTargetPanel)
                                 }
                             }
+                        }
+                        if model.perspective == .learning && showLearningCapturesPanel {
+                            LearningScreenCapturesPanel(model: model) {
+                                withAnimation(.easeInOut(duration: 0.18)) { showLearningCapturesPanel = false }
+                            }
+                            .frame(minWidth: 270, idealWidth: 320)
+                            .padding(.leading, 10)
                         }
                     }.frame(minHeight: 300)
                 } else {
@@ -906,9 +961,61 @@ struct ContentView: View {
                                 dropTargetPanel = targeted ? panel.rawValue : (dropTargetPanel == panel.rawValue ? nil : dropTargetPanel)
                             }
                         }
+                        if model.perspective == .learning && showLearningCapturesPanel {
+                            LearningScreenCapturesPanel(model: model) {
+                                withAnimation(.easeInOut(duration: 0.18)) { showLearningCapturesPanel = false }
+                            }
+                            .frame(minWidth: 270, idealWidth: 320)
+                            .padding(.leading, 10)
+                        }
                     }.frame(minHeight: 260)
                 }
             }.padding(model.topHeaderCollapsed ? 8 : 14)
+                .overlay(alignment: .topTrailing) {
+                    // Floating non-shifting notification stack so transient errors/notices never push the STT panel up or down.
+                    VStack(alignment: .trailing, spacing: 6) {
+                        if let error = model.message {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                                Text(error).foregroundStyle(.red).lineLimit(2).textSelection(.enabled)
+                                Button { model.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.red.opacity(0.35), lineWidth: 1))
+                            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                        }
+                        if let error = model.deviceError {
+                            HStack(spacing: 8) {
+                                Image(systemName: "mic.slash.fill").foregroundStyle(.orange)
+                                Text(error).foregroundStyle(.orange).lineLimit(2)
+                                Button("기본 마이크 사용") { model.useDefaultInputDevice() }.controlSize(.mini)
+                                Button(model.t("settings.captureTitle")) { showingCaptureSettings = true }.controlSize(.mini)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.orange.opacity(0.35), lineWidth: 1))
+                            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                        }
+                        if !model.topHeaderCollapsed, let notice = model.presetNotice {
+                            HStack(spacing: 8) {
+                                Image(systemName: "info.circle.fill").foregroundStyle(.blue)
+                                Text(notice).foregroundStyle(.blue).lineLimit(2)
+                                Button { model.presetNotice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.blue.opacity(0.30), lineWidth: 1))
+                            .shadow(color: .black.opacity(0.10), radius: 5, y: 2)
+                        }
+                    }
+                    .frame(maxWidth: 540, alignment: .trailing)
+                    .padding(.top, model.topHeaderCollapsed ? 38 : 98)
+                    .padding(.trailing, 16)
+                }
                 .background(WindowPrivacyController(hideFromScreenShare: model.hideFromScreenShare).allowsHitTesting(false))
                 .background(ReadingSpaceShortcut(enabled: !showingModels && !showingSettings && !showingCaptureSettings && !showingPanelFonts && pendingDeletion.isEmpty && model.replayTarget == nil && model.perspective != .presentation) {
                     if model.followLive { model.pauseReading() } else { model.resumeReading() }
@@ -959,6 +1066,80 @@ struct ContentView: View {
                         try? await Task.sleep(for: .seconds(3))
                     }
                 }
+            }
+
+            // Mouse-driven auto-hide left conversation list drawer
+            if model.sidebarAutoHide {
+                if !sidebarHoverVisible {
+                    // Subtle left-edge visual cue pill (hovering or clicking reveals the sidebar)
+                    VStack {
+                        Spacer()
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.35))
+                            .frame(width: 4, height: 44)
+                            .padding(.leading, 3)
+                        Spacer()
+                    }
+                    .frame(width: 14, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                            sidebarHoverVisible = true
+                        }
+                    }
+                    .help("마우스를 왼쪽 가장자리로 가져가면 대화 목록이 자동으로 나타납니다")
+                }
+
+                if sidebarHoverVisible {
+                    Color.black.opacity(0.05)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            sidebarSearchFocused = false
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                sidebarHoverVisible = false
+                            }
+                        }
+                        .transition(.opacity)
+
+                    HStack(spacing: 0) {
+                        conversationSidebarContent
+                            .background(.regularMaterial)
+                            .overlay(alignment: .trailing) {
+                                Divider()
+                            }
+                            .shadow(color: .black.opacity(0.18), radius: 14, x: 4, y: 0)
+                        Spacer(minLength: 0)
+                    }
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    .zIndex(2)
+                }
+            }
+        }
+        .background(
+            LeftEdgeMouseMonitor(
+                isAutoHideEnabled: model.sidebarAutoHide,
+                isRevealed: sidebarHoverVisible,
+                isBusy: sidebarIsBusy,
+                sidebarWidth: SidebarAutoHidePolicy.defaultSidebarWidth,
+                onReveal: {
+                    if !sidebarHoverVisible {
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.88)) {
+                            sidebarHoverVisible = true
+                        }
+                    }
+                },
+                onHide: {
+                    if sidebarHoverVisible {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            sidebarHoverVisible = false
+                        }
+                    }
+                }
+            )
+            .allowsHitTesting(false)
+        )
+        .onChange(of: model.sidebarAutoHide) { _, autoHide in
+            if !autoHide { sidebarHoverVisible = false }
         }
     }
 
@@ -1144,11 +1325,17 @@ struct AdviceCardBody: View {
 
 struct CoachView: View {
     @ObservedObject var model: AppModel
+    var pausesLiveReadingOnScroll: Bool = true
     @State private var showHistory = false
+    @State private var showCustomGoal = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let strategy = model.coachStrategy
+        VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
-                Label(model.t("panel.coach"), systemImage: "sparkles").font(.headline)
+                Label(model.t("panel.coach"), systemImage: "sparkles")
+                    .font(.headline)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 Text(model.coachLanguageSummary)
                     .font(.caption2.bold())
                     .padding(.horizontal, 6).padding(.vertical, 2)
@@ -1157,15 +1344,123 @@ struct CoachView: View {
                 Spacer(minLength: 4)
                 PanelFontButton(title: "대화 코치", value: $model.panelTypography.advice, defaultValue: 18)
                 if !model.followLive { Button(model.t("reading.resume")) { model.resumeReading() }.font(.caption) }
-                if model.generating { ProgressView().controlSize(.small) }
+                ProgressView()
+                    .controlSize(.small)
+                    .opacity(model.generating ? 1 : 0)
+                    .frame(width: 16, height: 16)
             }
-            HStack(spacing: 12) {
+            .frame(height: 22)
+
+            // Multi-directional Coach Strategy Selector (4 groups × 13 directions)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Menu {
+                        ForEach(CoachStrategyGroup.allCases) { group in
+                            Section(group.rawValue) {
+                                ForEach(group.strategies) { option in
+                                    Button {
+                                        model.coachStrategy = option
+                                    } label: {
+                                        if model.coachStrategy == option {
+                                            Label(option.title, systemImage: "checkmark")
+                                        } else {
+                                            Label(option.title, systemImage: option.icon)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: strategy.icon)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(strategy.tintColor)
+                            Text(strategy.title)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(strategy.tintColor.opacity(0.14), in: Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("대화 코치 방향·카테고리 선택 (4개 영역 · 13가지 방향)")
+
+                    Text(strategy.group.rawValue)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { showCustomGoal.toggle() }
+                    } label: {
+                        Image(systemName: showCustomGoal ? "pencil.circle.fill" : "pencil.circle")
+                            .font(.caption)
+                            .foregroundStyle(showCustomGoal ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("추가 코치 목표 직접 입력")
+                }
+
+                // 1-click horizontal category pills
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(CoachStrategy.allCases) { option in
+                            let selected = model.coachStrategy == option
+                            Button {
+                                model.coachStrategy = option
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: option.icon)
+                                        .font(.system(size: 9, weight: .semibold))
+                                    Text(option.shortLabel)
+                                        .font(.caption2.weight(selected ? .bold : .medium))
+                                        .lineLimit(1)
+                                }
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .foregroundStyle(selected ? Color.white : Color.primary.opacity(0.85))
+                                .background(selected ? option.tintColor : Color.secondary.opacity(0.10), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .help("\(option.title) · \(option.subtitle)")
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+
+                Text(strategy.subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if showCustomGoal {
+                    TextField("추가 코치 목표 (예: 일정 합의 우선, 가격 방어)", text: $model.goal)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
+            }
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(strategy.tintColor.opacity(0.24), lineWidth: 0.9))
+
+            HStack(spacing: 10) {
                 Toggle("자동 답변 · 조언", isOn: $model.autoAdvice).font(.caption)
-                Toggle("STT + 번역 동시 코칭", isOn: $model.bilingualCoach)
+                Toggle("STT + 번역 동시", isOn: $model.bilingualCoach)
                     .font(.caption)
                     .help("STT 인식 언어와 번역 언어 두 가지로 답변과 조언을 함께 생성합니다.")
+                Spacer(minLength: 2)
+                Toggle("전체", isOn: $showHistory)
+                    .font(.caption)
+                    .help("전체 조언 기록 표시")
             }
-            Toggle("전체 조언 기록", isOn: $showHistory).font(.caption)
             let showAll = showHistory || model.recentSeconds == 0
             TimelineView(LiveActivitySchedule(active: model.listening && model.followLive && !showAll)) { timeline in
             let cutoff = activityReference(model, now: timeline.date).addingTimeInterval(-Double(model.recentSeconds))
@@ -1181,14 +1476,24 @@ struct CoachView: View {
                         }.padding(14).background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                     }
                     if adviceItems.isEmpty && (!model.followLive || model.liveResponse.isEmpty) {
-                        ContentUnavailableView("다음 한마디를 함께", systemImage: "bubble.left.and.bubble.right", description: Text("대화를 시작하면 맥락에 맞는 질문과 표현을 제안합니다."))
+                        ContentUnavailableView("다음 한마디를 함께", systemImage: strategy.icon, description: Text("현재 방향(\(strategy.title)): \(strategy.subtitle)"))
                     }
                     ForEach(adviceItems.reversed()) { advice in
                         let latest = advice.id == adviceItems.last?.id
+                        let cardStrategy = advice.strategyID.flatMap(CoachStrategy.init(rawValue:))
                         VStack(alignment: .leading, spacing: 8) {
-                            HStack {
+                            HStack(spacing: 6) {
                                 Text(advice.date, format: .dateTime.hour().minute().second()).font(.caption2)
-                                if latest { Spacer(); Text("최신 조언").font(.caption.bold()) }
+                                if let cardStrategy {
+                                    Label(cardStrategy.shortLabel, systemImage: cardStrategy.icon)
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1.5)
+                                        .background(latest ? Color.white.opacity(0.20) : cardStrategy.tintColor.opacity(0.14), in: Capsule())
+                                        .foregroundStyle(latest ? Color.white : cardStrategy.tintColor)
+                                }
+                                Spacer(minLength: 4)
+                                if latest { Text("최신 조언").font(.caption.bold()) }
                             }.foregroundStyle(latest ? Color.white.opacity(0.85) : Color.secondary)
                             if let conversation = model.displayConversation {
                                 LinkBadge(model: model, spans: ConversationLinks.spans(for: advice, in: conversation), context: true)
@@ -1205,18 +1510,52 @@ struct CoachView: View {
                     }
                 }
             }
-            .readingScrollControl(model)
+            .readingScrollControl(model, enabled: pausesLiveReadingOnScroll)
             .onChange(of: model.selectedLiveBlockID) { _, selected in
                 if let selected, let conversation = model.displayConversation,
                    let advice = adviceItems.last(where: { ConversationLinks.spans(for: $0, in: conversation).contains { $0.id == selected } }) { proxy.scrollTo(advice.id, anchor: .center) }
             }
-            .onChange(of: model.displayConversation?.advice.count) { _, _ in if model.followLive { proxy.scrollTo("coach-top", anchor: .top) } }
+            .onChange(of: model.displayConversation?.advice.count) { _, _ in
+                if model.followLive {
+                    var t = Transaction()
+                    t.disablesAnimations = true
+                    withTransaction(t) { proxy.scrollTo("coach-top", anchor: .top) }
+                }
+            }
             .onChange(of: model.followLive) { _, follow in if follow { proxy.scrollTo("coach-top", anchor: .top) } }
             .onAppear { if model.followLive { proxy.scrollTo("coach-top", anchor: .top) } }
             }
             }
-            Button { Task { await model.advise() } } label: { Label("지금 조언 받기  ⌘↵", systemImage: "sparkles").frame(maxWidth: .infinity) }
-                .buttonStyle(.borderedProminent).disabled(model.generating || (model.displayConversation?.transcript.isEmpty ?? true))
+            HStack(spacing: 6) {
+                Button { Task { await model.advise() } } label: {
+                    Label("\(strategy.shortLabel) 조언 받기  ⌘↵", systemImage: strategy.icon)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(strategy.tintColor)
+                .disabled(model.generating || (model.displayConversation?.transcript.isEmpty ?? true))
+
+                Menu {
+                    ForEach(CoachStrategyGroup.allCases) { group in
+                        Section("\(group.rawValue) 방향으로 즉시 받기") {
+                            ForEach(group.strategies) { option in
+                                Button {
+                                    Task { await model.advise(automatic: false, strategyOverride: option) }
+                                } label: {
+                                    Label(option.title, systemImage: option.icon)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption.weight(.semibold))
+                }
+                .menuStyle(.borderedButton)
+                .fixedSize()
+                .disabled(model.generating || (model.displayConversation?.transcript.isEmpty ?? true))
+                .help("기본 방향을 바꾸지 않고 다른 각도(협상·반론·핵심 질문 등)로 즉시 1회 조언 받기")
+            }
         }
     }
 }
@@ -1312,29 +1651,33 @@ struct TranslationView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        if model.followLive && !model.translationSource.isEmpty {
-                            translationPair(source: model.translationSource, translated: model.liveTranslation.isEmpty ? "번역 중…" : model.liveTranslation, latest: true)
-                        } else if model.followLive, let preview = model.translationPreview {
-                            translationPair(source: preview.source, translated: preview.translated, latest: true)
-                        } else if let pinnedEntry {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    if let conversation = model.displayConversation { LinkBadge(model: model, spans: ConversationLinks.spans(for: pinnedEntry, in: conversation)) }
-                                    if let date = RecentActivity.sourceDate(for: pinnedEntry, spans: model.displayConversation?.transcriptSpans ?? []) {
-                                        Text(date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
+                        ScrollView(.vertical, showsIndicators: true) {
+                            if model.followLive && !model.translationSource.isEmpty {
+                                translationPair(source: model.translationSource, translated: model.liveTranslation.isEmpty ? "번역 중…" : model.liveTranslation, latest: true)
+                            } else if model.followLive, let preview = model.translationPreview {
+                                translationPair(source: preview.source, translated: preview.translated, latest: true)
+                            } else if let pinnedEntry {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        if let conversation = model.displayConversation { LinkBadge(model: model, spans: ConversationLinks.spans(for: pinnedEntry, in: conversation)) }
+                                        if let date = RecentActivity.sourceDate(for: pinnedEntry, spans: model.displayConversation?.transcriptSpans ?? []) {
+                                            Text(date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
+                                        }
                                     }
+                                    translationPair(source: pinnedEntry.source, translated: pinnedEntry.translated, latest: true)
                                 }
-                                translationPair(source: pinnedEntry.source, translated: pinnedEntry.translated, latest: true)
+                            } else {
+                                Text("대화를 시작하면 최신 \(model.targetLanguageName) 번역이 흔들림 없이 이 고정 창에 표시됩니다.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
+                                    .padding(10)
+                                    .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                             }
-                        } else {
-                            Text("대화를 시작하면 최신 \(model.targetLanguageName) 번역이 스크롤 없이 이 자리에 고정 표시됩니다.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
-                                .padding(10)
-                                .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                         }
+                        .frame(height: 172)
                     }
+                    .transaction { $0.animation = nil }
                     if !historyEntries.isEmpty {
                         HStack(spacing: 6) {
                             Text("이전 번역 기록")
@@ -1370,7 +1713,7 @@ struct TranslationView: View {
                             Color.clear.frame(height: 1).id("translation-end")
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .readingScrollControl(model)
+                    .readingScrollControl(model, enabled: !pinLatestSpotlight)
                     .onChange(of: model.selectedLiveBlockID) { _, selected in
                         if let selected, let conversation = model.displayConversation,
                            let entry = historyEntries.first(where: { ConversationLinks.spans(for: $0, in: conversation).contains { $0.id == selected } }) { proxy.scrollTo(entry.id, anchor: .center) }
@@ -1776,6 +2119,9 @@ struct STTPanel: View {
                 .controlSize(.small)
                 .disabled(model.sttAppearance.fontSize <= STTAppearance.minFontSize)
                 .help("STT 글자 작게 (최소 \(Int(STTAppearance.minFontSize))pt)")
+                Text("\(Int(model.sttAppearance.fontSize))pt")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(model.sttAppearance.text.color.opacity(0.85))
                 Button("A+") {
                     model.sttAppearance.fontSize = min(STTAppearance.maxFontSize, model.sttAppearance.fontSize + 1)
                 }
@@ -1823,9 +2169,10 @@ struct STTPanel: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     if usePinnedSTT {
+                        let sttLiveHeight: CGFloat = max(116, min(220, CGFloat(model.sttAppearance.latestFontSize) * 4.0 + 42))
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 6) {
-                                Label("최신 원문 고정", systemImage: "pin.fill")
+                                Label("실시간 원문 고정 창", systemImage: "pin.fill")
                                     .font(.caption2.bold())
                                     .foregroundStyle(model.sttAppearance.latestText.color.opacity(0.9))
                                 Spacer()
@@ -1839,31 +2186,46 @@ struct STTPanel: View {
                                 liveSTT: model.liveSTT,
                                 appearance: model.sttAppearance,
                                 followLive: model.followLive,
-                                compact: true
+                                isListening: model.listening,
+                                compact: false,
+                                alwaysReserveSpace: true,
+                                fixedHeight: sttLiveHeight,
+                                idlePlaceholder: model.listening ? "음성 대기 중… 한 문장이 온전히 여기에 고정 표시됩니다." : "듣기를 시작하면 실시간 STT 결과가 여기에 고정 표시됩니다."
                             )
-                            if let pinnedSpan {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        LinkBadge(model: model, spans: [pinnedSpan])
-                                        Text(pinnedSpan.date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(model.sttAppearance.latestText.color.opacity(0.8))
-                                        Text("최신 발언").font(.caption.bold()).foregroundStyle(model.sttAppearance.latestText.color)
+                            ScrollView(.vertical, showsIndicators: true) {
+                                if let pinnedSpan {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack {
+                                            LinkBadge(model: model, spans: [pinnedSpan])
+                                            Text(pinnedSpan.date, format: .dateTime.hour().minute().second()).font(.caption2).foregroundStyle(.secondary)
+                                            Text("최신 발언").font(.caption.bold()).foregroundStyle(.secondary)
+                                        }
+                                        Text(pinnedSpan.text)
+                                            .font(.system(size: model.sttAppearance.latestFontSize, weight: .semibold))
+                                            .foregroundStyle(Color.primary)
+                                            .multilineTextAlignment(.leading)
+                                            .lineLimit(nil)
+                                            .lineSpacing(model.sttAppearance.fontSize <= 13 ? 3 : 5)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
-                                    Text(pinnedSpan.text).font(.system(size: model.sttAppearance.latestFontSize, weight: .semibold))
-                                        .lineSpacing(model.sttAppearance.fontSize <= 13 ? 3 : 5).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .padding(12)
-                                .foregroundStyle(model.sttAppearance.latestText.color)
-                                .background(model.sttAppearance.latestBackground.color, in: RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(model.sttAppearance.latestBackground.color, lineWidth: 2))
-                            } else if model.displayConversation?.transcript.isEmpty != false {
-                                Text("대화를 시작하면 최근 발언이 스크롤 없이 이 자리에 고정 표시됩니다.")
-                                    .font(.caption)
-                                    .foregroundStyle(model.sttAppearance.text.color.opacity(0.75))
-                                    .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
                                     .padding(10)
-                                    .background(model.sttAppearance.text.color.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.secondary.opacity(0.24), lineWidth: 1))
+                                } else {
+                                    Text("발화가 완료되면 최신 문장이 흔들림 없이 이 고정 창에 표시됩니다.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
+                                        .padding(10)
+                                        .background(Color(nsColor: .textBackgroundColor).opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+                                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.8))
+                                }
                             }
+                            .frame(height: 148)
                         }
+                        .transaction { $0.animation = nil }
                         if !historySpans.isEmpty {
                             HStack(spacing: 6) {
                                 Text("이전 발언 기록")
@@ -1928,7 +2290,8 @@ struct STTPanel: View {
                                 Color.clear.frame(height: 1).id("stt-bottom")
                             }.padding(4)
                         }
-                        .readingScrollControl(model)
+                        .readingScrollControl(model, enabled: !usePinnedSTT)
+                        .transaction { $0.animation = nil }
                         .onChange(of: model.selectedLiveBlockID) { _, selected in if let selected { proxy.scrollTo(selected, anchor: .center) } }
                         .onChange(of: model.displayConversation?.transcript) { _, _ in if !usePinnedSTT && model.followLive { proxy.scrollTo("stt-bottom", anchor: .bottom) } }
                         .onChange(of: model.followLive) { _, follow in if !usePinnedSTT && follow { proxy.scrollTo("stt-bottom", anchor: .bottom) } }

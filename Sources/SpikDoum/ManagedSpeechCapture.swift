@@ -519,7 +519,6 @@ final class AudioMuteFlag: @unchecked Sendable {
                     self.onLatency?(Int(Date().timeIntervalSince(start) * 1000))
                     self.interimText = ""
                     self.agreement.reset()
-                    self.onInterimText?("")
                     if let cleaned = ManagedSTTPolicy.sanitize(rawText, previousChunk: self.lastCleanChunk) {
                         self.lastCleanChunk = cleaned
                         self.lastCleanChunkAt = Date()
@@ -542,6 +541,7 @@ final class AudioMuteFlag: @unchecked Sendable {
                         self.text = [self.text, cleaned].filter { !$0.isEmpty }.joined(separator: "\n")
                         self.onText?(self.text)
                     } else {
+                        self.onInterimText?("")
                         // Reset prompt context after filtered silence/hallucination so it cannot poison the next chunk.
                         self.lastCleanChunk = ""
                         if self.onInterimText == nil && !self.text.isEmpty { self.onText?(self.text) }

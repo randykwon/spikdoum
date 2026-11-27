@@ -125,6 +125,46 @@ struct PresentationCueCard: Identifiable, Equatable, Sendable {
     }
 }
 
+enum PostItColor: String, CaseIterable, Codable, Identifiable, Sendable {
+    case yellow
+    case mint
+    case pink
+    case sky
+    case lavender
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .yellow: return "노랑 (기본)"
+        case .mint: return "민트 (답변 완료)"
+        case .pink: return "핑크 (핵심/중요)"
+        case .sky: return "하늘 (후속 조치)"
+        case .lavender: return "라벤더 (기술 질문)"
+        }
+    }
+}
+
+struct PresentationQuestionNote: Codable, Identifiable, Equatable, Sendable {
+    var id = UUID()
+    var createdAt: Date = Date()
+    var slideNumber: Int? = nil
+    var slideTitle: String? = nil
+    var sourceLabel: String = "청중 질문"
+    var questionText: String
+    var translatedText: String? = nil
+    var recommendedAnswer: String? = nil
+    var recommendedAnswerLocal: String? = nil
+    var recommendedAnswerAt: Date? = nil
+    var answerMemo: String = ""
+    var color: PostItColor = .yellow
+    var isResolved: Bool = false
+    var isPinned: Bool = false
+    var autoCaptured: Bool = false
+    var audioClip: AudioClipRecord? = nil
+    var sourceSpanID: UUID? = nil
+}
+
 struct PresentationSession: Codable, Equatable, Sendable {
     static let starterTemplate = """
     # 오프닝 & 배경 [2분]
@@ -162,6 +202,11 @@ struct PresentationSession: Codable, Equatable, Sendable {
     var linkedDeckPath: String? = nil
     var linkedDeckNotesHash: String? = nil
     var linkedDeckSyncedAt: Date? = nil
+    var questionNotes: [PresentationQuestionNote]? = nil
+
+    var resolvedQuestionNotes: [PresentationQuestionNote] {
+        questionNotes ?? []
+    }
 
     static func notesFingerprint(_ text: String) -> String {
         let normalized = text
@@ -182,6 +227,7 @@ struct PresentationSession: Codable, Equatable, Sendable {
         copy.elapsedSeconds = 0
         copy.sectionElapsed = [:]
         copy.inQAMode = false
+        copy.questionNotes = []
         copy.checklist = checklist.map { item in
             PresentationChecklistItem(
                 id: UUID(),

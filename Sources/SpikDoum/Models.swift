@@ -12,6 +12,7 @@ struct Advice: Codable, Identifiable {
     var sourceStart: Int? = nil
     var sourceEnd: Int? = nil
     var sourceExcerpt: String? = nil
+    var strategyID: String? = nil
 }
 struct TranslationEntry: Codable, Identifiable {
     var id = UUID()
@@ -62,6 +63,7 @@ struct Conversation: Codable, Identifiable {
     var audioClips: [AudioClipRecord]? = nil
     var organizedScript: OrganizedScript? = nil
     var presentation: PresentationSession? = nil
+    var screenCaptures: [LearningScreenCapture]? = nil
     var allKeywords: [String] {
         KeywordPolicy.merged(current: keywords, history: keywordHistory ?? [])
     }
@@ -123,7 +125,8 @@ enum AdvicePolicy {
         sourceSnapshot: String?,
         sourceStart: Int?,
         sourceEnd: Int?,
-        sourceExcerpt: String?
+        sourceExcerpt: String?,
+        strategyID: String? = nil
     ) -> Advice {
         if let pair = parseBilingual(raw) {
             let srcLabel = sourceLanguageName ?? "STT"
@@ -138,7 +141,8 @@ enum AdvicePolicy {
                 sourceSnapshot: sourceSnapshot,
                 sourceStart: sourceStart,
                 sourceEnd: sourceEnd,
-                sourceExcerpt: sourceExcerpt
+                sourceExcerpt: sourceExcerpt,
+                strategyID: strategyID
             )
         }
         return Advice(
@@ -146,7 +150,8 @@ enum AdvicePolicy {
             sourceSnapshot: sourceSnapshot,
             sourceStart: sourceStart,
             sourceEnd: sourceEnd,
-            sourceExcerpt: sourceExcerpt
+            sourceExcerpt: sourceExcerpt,
+            strategyID: strategyID
         )
     }
     static func context(_ text: String) -> String { String(text.suffix(3000)) }

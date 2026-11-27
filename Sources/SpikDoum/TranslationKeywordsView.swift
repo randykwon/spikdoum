@@ -129,9 +129,12 @@ struct TranslationKeywordsView: View {
                         .padding(.trailing, 2)
                     }
                     .frame(height: clampedHeight)
-                    .readingScrollControl(model)
                     .onChange(of: terms.first) { _, first in
-                        if model.followLive, let first { proxy.scrollTo(first, anchor: .top) }
+                        if model.followLive, let first {
+                            var t = Transaction()
+                            t.disablesAnimations = true
+                            withTransaction(t) { proxy.scrollTo(first, anchor: .top) }
+                        }
                     }
                 }
             } else {

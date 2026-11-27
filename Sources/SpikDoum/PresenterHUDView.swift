@@ -221,6 +221,21 @@ struct PresenterHUDView: View {
                 .tint(model.micMuted ? .red : .secondary)
                 .help("내 마이크 음소거 (⇧⌘M)")
 
+                // Quick Question Record Pin
+                Button {
+                    if model.recordingQuestionNote {
+                        model.stopAndSaveQuestionNoteRecording()
+                    } else {
+                        model.captureRecentQuestionAsPostIt()
+                    }
+                } label: {
+                    Image(systemName: model.recordingQuestionNote ? "stop.circle.fill" : "pin.fill")
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .tint(model.recordingQuestionNote ? .red : .orange)
+                .help(model.recordingQuestionNote ? "녹음 중인 질문기록 저장" : "방금 질문 음성과 내용을 질문기록에 저장 (⌥⌘Q)")
+
                 // Quick Q&A Toggle
                 Button {
                     model.togglePresentationQAMode()
@@ -368,6 +383,12 @@ struct PresenterHUDView: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("질문기록 저장") {
+                        model.captureRecentQuestionAsPostIt()
+                    }
+                    .controlSize(.mini)
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
                     if !session.inQAMode {
                         Button("Q&A 대응") { model.togglePresentationQAMode() }
                             .controlSize(.mini)

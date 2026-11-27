@@ -23,7 +23,11 @@ extension AppModel {
         }
     }
     func translateLatest(automatic: Bool = false) {
-        if !automatic { translationRetryCount = 0; translationRetryAfter = .distantPast }
+        if !automatic {
+            translationRetryCount = 0
+            translationRetryAfter = .distantPast
+            unavailableAppleTranslationPairs.removeAll()
+        }
         if Date() < translationRetryAfter { return }
         if translationRetryCount >= 3 {
             // Cooldown elapsed: reset retry count so automatic translation resumes instead of staying dead permanently.
@@ -52,7 +56,8 @@ extension AppModel {
         }
         if work.waitingForSentences {
             if translationBatchStartedAt == nil { translationBatchStartedAt = Date() }
-            translationStatus = simpleFastMode ? "심플 패스트 · 한 문장 모으는 중" : "한 문장 모으는 중…"
+            let waitingStatus = simpleFastMode ? "심플 패스트 · 한 문장 모으는 중" : "한 문장 모으는 중…"
+            if translationStatus != waitingStatus { translationStatus = waitingStatus }
             scheduleTranslation()
             return
         }
@@ -62,6 +67,43 @@ extension AppModel {
             return
         }
         let cleanedSource = TranslationPolicy.preparedForTranslation(source)
+        let preflightApplePair: String? = {
+            guard settings.translation == .apple, !cleanedSource.isEmpty else { return nil }
+            let targetSpec = targetLanguageSpec
+            let isMicTurn = TranslationPolicy.sourceTag(of: source) == "마이크"
+            let sentenceDetection = LanguageCatalog.detectLanguageDetailed(for: cleanedSource, preferredCodes: autoLanguagePrefs.preferredCodes)
+            let detectedSpec: SupportedLanguage?
+            if isMicTurn {
+                detectedSpec = sentenceDetection?.language ?? (micLanguageMode == .autoOrTarget ? targetSpec : sourceLanguageSpec)
+            } else if language == LanguageCatalog.autoCode {
+                detectedSpec = sentenceDetection?.language ?? detectedSTTLanguage
+            } else if let strong = sentenceDetection, strong.confidence >= 0.85, strong.language.shortCode != sourceLanguageSpec?.shortCode {
+                detectedSpec = strong.language
+            } else {
+                detectedSpec = sourceLanguageSpec
+            }
+            let recentForeignPartner = recentDetectedLanguages.first { $0.translationCode != targetSpec.translationCode }
+            let partnerSpec = sourceLanguageSpec ?? recentForeignPartner ?? detectedSTTLanguage
+            let effectiveTarget: SupportedLanguage
+            if isMicTurn,
+               let detectedSpec,
+               detectedSpec.translationCode == targetSpec.translationCode,
+               let partnerSpec,
+               partnerSpec.translationCode != targetSpec.translationCode {
+                effectiveTarget = partnerSpec
+            } else {
+                effectiveTarget = targetSpec
+            }
+            if let detectedSpec, detectedSpec.translationCode == effectiveTarget.translationCode {
+                return nil
+            }
+            let sourceCode = detectedSpec?.translationCode ?? "en"
+            return "\(sourceCode)->\(effectiveTarget.translationCode)"
+        }()
+        // Prevent continuous UI redraw strobing when an Apple on-device language pack is not installed.
+        if automatic, let pair = preflightApplePair, unavailableAppleTranslationPairs.contains(pair) {
+            return
+        }
         let token = UUID()
         translationToken = token
         translating = true
@@ -181,6 +223,12 @@ extension AppModel {
                 let entry = TranslationEntry(source: source, translated: self.liveTranslation, sourceLanguageCode: detectedSourceCode, targetLanguage: effectiveTargetCode, sourceStart: work.start, sourceEnd: work.end)
                 if self.conversations[index].translations == nil { self.conversations[index].translations = [] }
                 self.conversations[index].translations?.append(entry)
+                if self.conversations[index].presentation != nil {
+                    self.backfillQuestionNoteTranslation(entry, at: index)
+                }
+                if self.conversations[index].screenCaptures != nil {
+                    self.backfillLearningCaptureTranslation(entry, at: index)
+                }
                 self.translationPreview = nil
                 self.translationBatchStartedAt = nil
                 self.translationRetryCount = 0
@@ -192,10 +240,16 @@ extension AppModel {
                 self.save()
             } catch {
                 guard self.translationToken == token else { return }
-                self.translationStatus = "번역 오류 · 언어 모델과 연결 설정을 확인하세요"
+                let errStatus = "번역 오류 · 언어 모델과 연결 설정을 확인하세요"
+                if self.translationStatus != errStatus { self.translationStatus = errStatus }
+                self.translationSource = ""
                 UserDefaults.standard.set("\(self.language): \(error)", forKey: "translationDiagnostic")
                 if case TranslationError.notInstalled = error {
-                    self.translationError = "기기 내 번역 언어가 준비되지 않았습니다. ‘번역 언어 준비’를 누르거나 엔진 설정에서 Azure 번역을 선택해주세요."
+                    if let pair = preflightApplePair {
+                        self.unavailableAppleTranslationPairs.insert(pair)
+                    }
+                    let msg = "기기 내 번역 언어가 준비되지 않았습니다. ‘번역 언어 준비’를 누르거나 엔진 설정에서 Azure 번역을 선택해주세요."
+                    if self.translationError != msg { self.translationError = msg }
                 } else {
                     self.translationError = "번역 실패: \(error.localizedDescription)"
                     self.retryTranslation()
@@ -331,6 +385,7 @@ extension AppModel {
             try await session.prepareTranslation()
             translationError = nil
             nativeTranslationSessions.removeAll()
+            unavailableAppleTranslationPairs.removeAll()
             translateLatest()
         } catch {
             translationError = "번역 언어 준비 실패: \(error.localizedDescription). ‘번역 언어 준비’를 눌러 다시 시도하세요."

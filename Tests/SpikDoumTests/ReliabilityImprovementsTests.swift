@@ -1381,3 +1381,283 @@ func powerPointLiveEndToEndSlideShowControl() async throws {
     try await runAction(.firstSlide)
     #expect(monitor.currentSlideNumber == 1)
 }
+
+@Test func presentationQuestionPostItCapturesAudioClipsDetectsQuestionsAndPersists() throws {
+    let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("SpikDoum-QNoteTest-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: tempRoot) }
+    let convoID = UUID()
+
+    // 1. Feed 2 seconds of 440Hz sine wave at 24kHz into QuestionAudioClipRecorder rolling ring buffer.
+    let recorder = QuestionAudioClipRecorder()
+    let sampleRate = 24000
+    let twoSeconds = (0..<(sampleRate * 2)).map { idx in
+        Float(sin(2.0 * Double.pi * 440.0 * Double(idx) / Double(sampleRate)) * 0.25)
+    }
+    let now = Date()
+    recorder.appendMonoSamples(Array(twoSeconds.prefix(sampleRate)), at: now.addingTimeInterval(-1.0))
+    recorder.appendMonoSamples(Array(twoSeconds.suffix(sampleRate)), at: now)
+
+    // 2. Retroactively export standalone `.m4a` clip from the rolling ring buffer and verify AVAudioFile readability.
+    let retroClip = recorder.exportRecentClip(
+        conversationID: convoID,
+        recordingsRoot: tempRoot,
+        from: now.addingTimeInterval(-2.0),
+        to: now,
+        fallbackSeconds: 5.0,
+        sourceSummary: "Meet 청중"
+    )
+    #expect(retroClip != nil)
+    if let retroClip {
+        #expect(retroClip.filename.hasPrefix("question-"))
+        #expect(retroClip.filename.hasSuffix(".m4a"))
+        #expect(retroClip.duration >= 1.5)
+        let url = RecordingStorage.clipURL(conversationID: convoID, filename: retroClip.filename, root: tempRoot)
+        let readable = try AVAudioFile(forReading: url)
+        #expect(readable.length > 0)
+        // Verify full-EOF `.m4a` -> 16kHz mono PCM16 decode for automatic question STT (Whisper / Parakeet).
+        let decodedPCM = try QuestionAudioTranscriber.decodeTo16kMonoPCM16(url: url)
+        #expect(decodedPCM.count >= 16000 * 2) // at least 1s of 16kHz Int16 PCM
+    }
+
+    // Verify two-way automatic question translation target selection (EN -> KO, KO -> EN).
+    let koLang = LanguageCatalog.language(for: "ko-KR")!
+    let enLang = LanguageCatalog.language(for: "en-US")!
+    #expect(QuestionTranslationLanguageResolver.targetLanguage(for: "How do you validate SQL outputs?", userTarget: koLang, presentationLanguage: enLang)?.code == "ko-KR")
+    #expect(QuestionTranslationLanguageResolver.targetLanguage(for: "지연 시간은 얼마나 줄었나요?", userTarget: koLang, presentationLanguage: enLang)?.code == "en-US")
+
+    // 3. Dedicated manual recording with pre-roll exports a separate standalone `.m4a` clip.
+    try recorder.startManualRecording(preRollSeconds: 1.0, useStandaloneMic: false)
+    recorder.appendMonoSamples(Array(twoSeconds.prefix(sampleRate)), at: now.addingTimeInterval(1.0))
+    let manualClip = recorder.stopManualRecordingAndExport(
+        conversationID: convoID,
+        recordingsRoot: tempRoot,
+        sourceSummary: "마이크"
+    )
+    #expect(manualClip != nil)
+    #expect(manualClip?.id != retroClip?.id)
+    #expect((manualClip?.duration ?? 0) >= 1.5)
+
+    // 4. Question detection heuristic handles Google Meet remote audio, `?`, and Q&A interrogatives accurately.
+    #expect(QuestionAudioClipRecorder.isLikelyQuestion("[Mac 재생음] How do you handle ontology hallucinations in production?", sourceTag: "Mac 재생음", inQAMode: false) == true)
+    #expect(QuestionAudioClipRecorder.isLikelyQuestion("Could you share the latency numbers?", sourceTag: "마이크", inQAMode: false) == true)
+    #expect(QuestionAudioClipRecorder.isLikelyQuestion("보안 감사는 어떻게 대응하셨나요", sourceTag: "마이크", inQAMode: true) == true)
+    #expect(QuestionAudioClipRecorder.isLikelyQuestion("Thank you all for joining today.", sourceTag: "마이크", inQAMode: false) == false)
+
+    // 5. PresentationQuestionNote Codable round-trip (including AI recommended answer) & answer parser.
+    let parsedBilingual = QuestionAnswerParser.parse("""
+    [ANSWER_SPEAK]
+    We enforce strict schema guardrails before executing any generated query.
+    [ANSWER_LOCAL]
+    생성된 쿼리를 실행하기 전에 엄격한 스키마 가드레일을 적용합니다.
+    - 핵심 포인트: 정확도 검증 수치를 함께 언급하세요.
+    """)
+    #expect(parsedBilingual.speak == "We enforce strict schema guardrails before executing any generated query.")
+    #expect(parsedBilingual.local?.contains("스키마 가드레일") == true)
+    let parsedPlain = QuestionAnswerParser.parse("간결하게 핵심 구조부터 설명하면 좋습니다.")
+    #expect(parsedPlain.speak == "간결하게 핵심 구조부터 설명하면 좋습니다.")
+    #expect(parsedPlain.local == nil)
+
+    var session = PresentationSession()
+    session.questionNotes = [
+        PresentationQuestionNote(
+            slideNumber: 4,
+            slideTitle: "Ontology Architecture",
+            sourceLabel: "Meet 청중",
+            questionText: "How do you validate SQL outputs?",
+            translatedText: "SQL 출력은 어떻게 검증하시나요?",
+            recommendedAnswer: parsedBilingual.speak,
+            recommendedAnswerLocal: parsedBilingual.local,
+            recommendedAnswerAt: Date(),
+            answerMemo: "Schema guardrails + deterministic test suite",
+            color: .sky,
+            isResolved: false,
+            isPinned: true,
+            autoCaptured: true,
+            audioClip: retroClip
+        )
+    ]
+    let encoded = try JSONEncoder().encode(session)
+    let decoded = try JSONDecoder().decode(PresentationSession.self, from: encoded)
+    #expect(decoded.resolvedQuestionNotes.count == 1)
+    #expect(decoded.resolvedQuestionNotes[0].slideNumber == 4)
+    #expect(decoded.resolvedQuestionNotes[0].recommendedAnswer == parsedBilingual.speak)
+    #expect(decoded.resolvedQuestionNotes[0].recommendedAnswerLocal == parsedBilingual.local)
+    #expect(decoded.resolvedQuestionNotes[0].audioClip?.filename == retroClip?.filename)
+    #expect(decoded.clonedForNewRun().resolvedQuestionNotes.isEmpty)
+}
+
+@Test func sidebarAutoHidePolicyRevealsOnLeftEdgeAndProtectsBusyState() {
+    let size = CGSize(width: 1200, height: 800)
+
+    // 1. Hovering near left edge reveals hidden sidebar; center workspace does not.
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 6, y: 300), viewSize: size, isRevealed: false, isPinned: false, isBusy: false) == .reveal)
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 18, y: 300), viewSize: size, isRevealed: false, isPinned: false, isBusy: false) == .reveal)
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 200, y: 300), viewSize: size, isRevealed: false, isPinned: false, isBusy: false) == .ignore)
+
+    // 2. While revealed, staying inside sidebar + hysteresis margin keeps it open; moving away schedules hide.
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 245, y: 300), viewSize: size, isRevealed: true, isPinned: false, isBusy: false) == .keepOpen)
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 262, y: 300), viewSize: size, isRevealed: true, isPinned: false, isBusy: false) == .keepOpen)
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 320, y: 300), viewSize: size, isRevealed: true, isPinned: false, isBusy: false) == .scheduleHide)
+
+    // 3. Busy state (typing search / multi-select) keeps sidebar open even when pointer moves out.
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 500, y: 300), viewSize: size, isRevealed: true, isPinned: false, isBusy: true) == .keepOpen)
+
+    // 4. Exiting window bounds schedules hide when revealed and idle; pinned mode always ignores auto-hide.
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: -10, y: 300), viewSize: size, isRevealed: true, isPinned: false, isBusy: false) == .scheduleHide)
+    #expect(SidebarAutoHidePolicy.evaluate(pointInView: CGPoint(x: 500, y: 300), viewSize: size, isRevealed: true, isPinned: true, isBusy: false) == .ignore)
+}
+
+@Test func learningScreenDiffDetectsSlideChangesAndPersistsCaptureRecords() throws {
+    func makeSolidImage(gray: UInt8) -> CGImage {
+        let side = 32
+        var bytes = [UInt8](repeating: gray, count: side * side)
+        let cs = CGColorSpaceCreateDeviceGray()
+        let ctx = CGContext(data: &bytes, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side, space: cs, bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        return ctx.makeImage()!
+    }
+
+    let slideA = makeSolidImage(gray: 30)
+    let slideAAlmostSame = makeSolidImage(gray: 34)
+    let slideB = makeSolidImage(gray: 210)
+
+    let fpA = LearningScreenDiff.luminanceFingerprint(of: slideA)
+    let fpASame = LearningScreenDiff.luminanceFingerprint(of: slideAAlmostSame)
+    let fpB = LearningScreenDiff.luminanceFingerprint(of: slideB)
+
+    // Identical or near-identical slide is skipped; genuinely changed slide triggers silent auto-capture.
+    #expect(LearningScreenDiff.shouldSaveAutoCapture(previousFingerprint: nil, currentFingerprint: fpA) == true)
+    #expect(LearningScreenDiff.normalizedDifference(fpA, fpASame) < LearningScreenDiff.defaultThreshold)
+    #expect(LearningScreenDiff.shouldSaveAutoCapture(previousFingerprint: fpA, currentFingerprint: fpASame) == false)
+    #expect(LearningScreenDiff.normalizedDifference(fpA, fpB) > 0.5)
+    #expect(LearningScreenDiff.shouldSaveAutoCapture(previousFingerprint: fpA, currentFingerprint: fpB) == true)
+
+    // Codable round-trip inside Conversation + Markdown export coverage.
+    var convo = Conversation(title: "Transformer Architecture")
+    convo.screenCaptures = [
+        LearningScreenCapture(
+            filename: "screen-test.jpg",
+            windowTitle: "Lecture 04 — Attention Mechanism",
+            appName: "Google Chrome",
+            transcriptExcerpt: "Self-attention computes pairwise relevance scores across all tokens.",
+            translationExcerpt: "셀프 어텐션은 모든 토큰 간의 상호 관련성 점수를 계산합니다.",
+            userNote: "Scaled dot-product 공식 복습",
+            autoCaptured: true,
+            pixelWidth: 1600,
+            pixelHeight: 900
+        )
+    ]
+    let encoded = try JSONEncoder().encode(convo)
+    let decoded = try JSONDecoder().decode(Conversation.self, from: encoded)
+    #expect(decoded.screenCaptures?.count == 1)
+    #expect(decoded.screenCaptures?[0].windowTitle == "Lecture 04 — Attention Mechanism")
+    let md = ConversationExport.markdown(for: decoded)
+    #expect(md.contains("## 강의 화면 기록 (1장)"))
+    #expect(md.contains("screen-test.jpg"))
+    #expect(md.contains("셀프 어텐션은 모든 토큰 간의 상호 관련성 점수를 계산합니다."))
+}
+
+@MainActor
+@Test func liveSTTDisplayStoreRetainsCommittedSentenceWithoutBlankFlicker() {
+    let store = LiveSTTDisplayStore()
+
+    // 1. Interim words arrive
+    store.update(text: "Now, notice the phrase", sourceTag: "Mac 재생음")
+    #expect(store.displayText == "Now, notice the phrase")
+    #expect(store.displaySourceTag == "Mac 재생음")
+    #expect(store.hasDisplayText == true)
+
+    // 2. Chunk commits — displayText stays non-empty (no blank placeholder strobe!)
+    store.commit(text: "Now, notice the phrase", sourceTag: "Mac 재생음")
+    #expect(store.text.isEmpty)
+    #expect(store.displayText == "Now, notice the phrase")
+    #expect(store.displaySourceTag == "Mac 재생음")
+    #expect(store.hasDisplayText == true)
+
+    // 3. Continuing clause from same source merges smoothly into a full sentence
+    store.update(text: "especially those in different time zones.", sourceTag: "Mac 재생음")
+    #expect(store.displayText == "Now, notice the phrase especially those in different time zones.")
+
+    store.commit(text: "especially those in different time zones.", sourceTag: "Mac 재생음")
+    #expect(store.displayText == "Now, notice the phrase especially those in different time zones.")
+
+    // 4. After sentence-ending punctuation, the next utterance replaces cleanly
+    store.commit(text: "Let's begin with slide two.", sourceTag: "Mac 재생음")
+    #expect(store.displayText == "Let's begin with slide two.")
+
+    // 5. latestUtterance strips source tags and extracts the newest line
+    let multi = "[Mac 재생음] First line.\n[Mac 재생음] Second line here."
+    #expect(LiveSTTDisplayStore.latestUtterance(from: multi) == "Second line here.")
+
+    // 6. Full clear wipes both live and committed text
+    store.clear()
+    #expect(store.hasDisplayText == false)
+    #expect(store.displayText.isEmpty)
+    #expect(store.displaySourceTag == nil)
+}
+
+@Test func linkedPanelLayoutSupportsIndependentRightCoachAndLegacyMigration() throws {
+    // 1. Default linked layout places independent Coach panel to the right of Linked main view
+    var layout = PanelLayout()
+    #expect(layout.visibleLinkedPanels(includeCoach: true, includeSummary: true) == [.main, .coach, .summary])
+    #expect(layout.visibleLinkedPanels(includeCoach: true, includeSummary: false) == [.main, .coach])
+
+    // 2. Hiding Coach removes it from Linked View panels while keeping main + summary
+    layout.setVisible(.coach, false, includeCoach: true)
+    #expect(layout.visibleLinkedPanels(includeCoach: true, includeSummary: true) == [.main, .summary])
+    layout.setVisible(.coach, true, includeCoach: true)
+    #expect(layout.visibleLinkedPanels(includeCoach: true, includeSummary: true) == [.main, .coach, .summary])
+
+    // 3. Reordering Coach right of Summary works and persists cleanly
+    layout.moveLinked(.coach, by: 1, includeCoach: true, includeSummary: true)
+    #expect(layout.visibleLinkedPanels(includeCoach: true, includeSummary: true) == [.main, .summary, .coach])
+    let data = try JSONEncoder().encode(layout)
+    let decoded = try JSONDecoder().decode(PanelLayout.self, from: data)
+    #expect(decoded.linkedOrder == [.main, .summary, .coach])
+
+    // 4. Legacy JSON without linkedOrder respects linkedSummaryOnLeft
+    let legacyJSON = #"{"splitOrder":["stt","translation","coach","summaryScript"],"linkedSummaryOnLeft":true,"summaryScriptReversed":false,"hiddenPanels":[]}"#.data(using: .utf8)!
+    let migrated = try JSONDecoder().decode(PanelLayout.self, from: legacyJSON)
+    #expect(migrated.linkedOrder == [.summary, .main, .coach])
+    #expect(migrated.linkedSummaryOnLeft == true)
+}
+
+@Test func coachStrategiesCoverAllGroupsBuildDirectedPromptsAndPersistStrategyID() throws {
+    // 1. Every strategy belongs to a group and all 4 groups are populated
+    let groupedCount = CoachStrategyGroup.allCases.reduce(0) { $0 + $1.strategies.count }
+    #expect(groupedCount == CoachStrategy.allCases.count)
+    #expect(CoachStrategy.allCases.count >= 12)
+    for group in CoachStrategyGroup.allCases {
+        #expect(!group.strategies.isEmpty)
+    }
+
+    // 2. Prompt instructions embed the selected strategy directive for both bilingual and single-language modes
+    let bilingualPrompt = CoachStrategy.negotiation.buildInstructions(partnerLang: "English", userLang: "한국어", bilingual: true)
+    #expect(bilingualPrompt.contains("[STT_LANG]"))
+    #expect(bilingualPrompt.contains("[TARGET_LANG]"))
+    #expect(bilingualPrompt.contains(CoachStrategy.negotiation.title))
+    #expect(bilingualPrompt.contains("Win-Win"))
+
+    let singlePrompt = CoachStrategy.criticalQuestion.buildInstructions(partnerLang: "English", userLang: "한국어", bilingual: false)
+    #expect(singlePrompt.contains(CoachStrategy.criticalQuestion.title))
+    #expect(!singlePrompt.contains("[STT_LANG]"))
+
+    // 3. effectiveGoal combines strategy goal with custom goal without duplicating default balanced goal
+    #expect(CoachStrategy.negotiation.effectiveGoal(customGoal: CoachStrategy.balanced.defaultGoal) == CoachStrategy.negotiation.defaultGoal)
+    #expect(CoachStrategy.negotiation.effectiveGoal(customGoal: "가격 10% 방어").contains("가격 10% 방어"))
+
+    // 4. Advice persists strategyID cleanly via Codable
+    let advice = AdvicePolicy.makeAdvice(
+        raw: "[STT_LANG]\nReply: Could we revisit the timeline?\nAdvice: Confirm scope before agreeing.\n[TARGET_LANG]\nReply: 일정을 다시 조율해 볼 수 있을까요?\nAdvice: 합의 전에 범위를 먼저 확정하세요.",
+        sourceLanguageName: "영어",
+        targetLanguageName: "한국어",
+        sourceSnapshot: "Can you ship Friday?",
+        sourceStart: 0,
+        sourceEnd: 20,
+        sourceExcerpt: "Can you ship Friday?",
+        strategyID: CoachStrategy.diplomaticPushback.rawValue
+    )
+    #expect(advice.strategyID == CoachStrategy.diplomaticPushback.rawValue)
+    let encoded = try JSONEncoder().encode(advice)
+    let decoded = try JSONDecoder().decode(Advice.self, from: encoded)
+    #expect(decoded.strategyID == CoachStrategy.diplomaticPushback.rawValue)
+}

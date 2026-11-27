@@ -135,7 +135,11 @@ extension AppModel {
             } else {
                 recordingConversationID = nil
             }
-            let micAudioSink: ((AVAudioPCMBuffer) -> Void)? = shouldRecord ? { buffer in recorder.append(buffer, source: .mic) } : nil
+            let qRecorder = questionAudioRecorder
+            let micAudioSink: ((AVAudioPCMBuffer) -> Void)? = { buffer in
+                if shouldRecord { recorder.append(buffer, source: .mic) }
+                qRecorder.append(buffer, source: .mic)
+            }
             if !systemAudioOnly {
                 let currentInputs = (try? AudioInputDevices.list()) ?? inputDevices
                 inputDevices = currentInputs
@@ -159,7 +163,7 @@ extension AppModel {
                         interimInterval: sttTier.whisperStreamingInterval ?? 0.28,
                         onText: { [weak self] text in
                             guard let self, self.captureRun == run else { return }
-                            self.liveSTT.clear(sourceTag: "마이크")
+                            self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: "마이크")
                             self.receiveDuplex(source: "마이크", text: text, prefix: prefix)
                         },
                         onInterim: { [weak self] interim in
@@ -178,7 +182,7 @@ extension AppModel {
                     let allowLock = autoLanguagePrefs.mode == .singleLanguageFast
                     try await managedMic.start(language: effectiveMicWhisperLanguage, externalAudio: false, inputDeviceUID: selectedInputUID, key: managedModels.authorization(.stt), interimInterval: streamingStep, allowWarmLanguageLock: allowLock, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
-                        self.liveSTT.clear(sourceTag: "마이크")
+                        self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: "마이크")
                         self.receiveDuplex(source: "마이크", text: text, prefix: prefix)
                     }, onInterim: { [weak self] interim in
                         guard let self, self.captureRun == run else { return }
@@ -235,7 +239,7 @@ extension AppModel {
                         if self.speakerStatus != status { self.speakerStatus = status }
                     }, onText: { [weak self] text in
                         guard let self, self.selectedID == id, self.captureRun == run else { return }
-                        self.liveSTT.clear(sourceTag: micSourceTag)
+                        self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: micSourceTag)
                         if self.sttStatus != "STT 수신 중" { self.sttStatus = "STT 수신 중" }
                         if self.includeSystemAudio { self.receiveDuplex(source: "마이크", text: text, prefix: prefix) }
                         else { self.updateText([prefix, text].filter { !$0.isEmpty }.joined(separator: "\n")) }
@@ -261,7 +265,7 @@ extension AppModel {
                         interimInterval: sttTier.whisperStreamingInterval ?? 0.28,
                         onText: { [weak self] text in
                             guard let self, self.captureRun == run else { return }
-                            self.liveSTT.clear(sourceTag: "Mac 재생음")
+                            self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: "Mac 재생음")
                             self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
                         },
                         onInterim: { [weak self] interim in
@@ -277,7 +281,7 @@ extension AppModel {
                     let allowLock = autoLanguagePrefs.mode == .singleLanguageFast
                     try await managedSystem.start(language: language, externalAudio: true, inputDeviceUID: "", key: managedModels.authorization(.stt), interimInterval: sttTier.whisperStreamingInterval, allowWarmLanguageLock: allowLock, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
-                        self.liveSTT.clear(sourceTag: "Mac 재생음")
+                        self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: "Mac 재생음")
                         self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
                     }, onInterim: { [weak self] interim in
                         guard let self, self.captureRun == run else { return }
@@ -297,7 +301,7 @@ extension AppModel {
                         if self.systemAudioOnly && self.sttStatus != status { self.sttStatus = status }
                     }, onSpeakerStatus: { _ in }, onText: { [weak self] text in
                         guard let self, self.captureRun == run else { return }
-                        self.liveSTT.clear(sourceTag: "Mac 재생음")
+                        self.liveSTT.commit(text: LiveSTTDisplayStore.latestUtterance(from: text), sourceTag: "Mac 재생음")
                         self.receiveDuplex(source: "Mac 재생음", text: text, prefix: prefix)
                     }, onInterim: { [weak self] interim in
                         guard let self, self.captureRun == run else { return }
@@ -315,6 +319,7 @@ extension AppModel {
                 // Deliver system audio buffers directly on ScreenCaptureKit's serial queue to keep strict FIFO ordering.
                 systemAudio.onBuffer = { buffer in
                     if shouldRecord { recorder.append(buffer, source: .system) }
+                    qRecorder.append(buffer, source: .system)
                     if useParakeetSystemSTT { parakeetSystemCapture.appendExternalAudio(buffer) }
                     else if useManagedSystemSTT { managedSystemCapture.appendExternalAudio(buffer) }
                     else { appleSystemCapture.appendExternalAudio(buffer) }
@@ -372,6 +377,9 @@ extension AppModel {
         captureRun = UUID()
         systemAudio.stop(); systemSpeech.stop(); cloudCapture.stop()
         liveSTT.clear()
+        if recordingQuestionNote {
+            stopAndSaveQuestionNoteRecording()
+        }
         finalizeAudioRecording()
         stableCloudTranscript = nil
         sttStatus = "듣기 중지"

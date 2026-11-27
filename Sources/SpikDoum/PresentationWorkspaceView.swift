@@ -14,7 +14,10 @@ struct PresentationWorkspaceView: View {
     @State private var showingAddPhrase = false
     @State private var phraseSearch = ""
     @State private var copiedPhraseID: UUID? = nil
+    @State private var qaShowingPostIts = false
+    @State private var liveCaptionDragStart: Double? = nil
     @AppStorage("presentationHeaderCollapsedV1") private var headerCollapsed = false
+    @AppStorage("presentationLiveSTTSlotHeightV1") private var liveCaptionSlotHeight: Double = 116
 
     init(model: AppModel) {
         self.model = model
@@ -22,8 +25,9 @@ struct PresentationWorkspaceView: View {
     }
 
     enum RightCompanionTab: String, CaseIterable {
-        case checklist = "필수 체크리스트"
-        case phrases = "전환구 치트시트"
+        case checklist = "체크리스트"
+        case questions = "질문기록"
+        case phrases = "전환구"
     }
 
     private var session: PresentationSession { model.activePresentation }
@@ -234,6 +238,33 @@ struct PresentationWorkspaceView: View {
 
                     Spacer(minLength: 4)
 
+                    if model.recordingQuestionNote {
+                        Button {
+                            model.stopAndSaveQuestionNoteRecording()
+                            rightTab = .questions
+                        } label: {
+                            Label("질문 저장", systemImage: "stop.circle.fill")
+                                .font(.caption2.weight(.bold))
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .help("녹음 중인 질문기록 저장")
+                    } else {
+                        Button {
+                            model.captureRecentQuestionAsPostIt()
+                            rightTab = .questions
+                        } label: {
+                            Label("질문기록", systemImage: "pin.fill")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                        .tint(.orange)
+                        .disabled(model.current?.archivedAt != nil)
+                        .help("방금 들린 질문과 음성을 질문기록으로 저장 (⌥⌘Q)")
+                    }
+
                     Button {
                         model.togglePresentationQAMode()
                     } label: {
@@ -374,6 +405,35 @@ struct PresentationWorkspaceView: View {
                 }
                 .controlSize(.small)
                 .help("현재 발표 타이머·큐카드·체크리스트를 새 리허설/실전 대화로 복제")
+
+                // One-Click Question Record Capture (Audio + STT + Translation)
+                if model.recordingQuestionNote {
+                    Button {
+                        model.stopAndSaveQuestionNoteRecording()
+                        rightTab = .questions
+                    } label: {
+                        Label("질문 저장 (\(model.recordingQuestionSeconds)초)", systemImage: "stop.circle.fill")
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .help("녹음 중인 질문의 음성과 내용을 질문기록으로 저장합니다")
+                } else {
+                    Button {
+                        model.captureRecentQuestionAsPostIt()
+                        rightTab = .questions
+                    } label: {
+                        let qCount = session.resolvedQuestionNotes.count
+                        Label(qCount > 0 ? "질문기록 (\(qCount))" : "질문기록", systemImage: "pin.fill")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+                    .disabled(model.current?.archivedAt != nil)
+                    .help("방금 들린 질문의 음성과 내용을 질문기록으로 즉시 저장합니다 (⌥⌘Q)")
+                }
 
                 // Q&A Mode Toggle
                 Button {
@@ -1066,9 +1126,14 @@ struct PresentationWorkspaceView: View {
                 liveSelfCaptionCard
                 Divider()
                 HStack {
+                    let qCount = session.resolvedQuestionNotes.count
                     Picker("발표 보조 도구", selection: $rightTab) {
                         ForEach(RightCompanionTab.allCases, id: \.self) { tab in
-                            Text(tab.rawValue).tag(tab)
+                            if tab == .questions && qCount > 0 {
+                                Text("\(tab.rawValue) (\(qCount))").tag(tab)
+                            } else {
+                                Text(tab.rawValue).tag(tab)
+                            }
                         }
                     }
                     .labelsHidden()
@@ -1077,6 +1142,8 @@ struct PresentationWorkspaceView: View {
                 }
                 if rightTab == .checklist {
                     checklistSection
+                } else if rightTab == .questions {
+                    PresentationQuestionNotesView(model: model)
                 } else {
                     signpostingSection
                 }
@@ -1087,13 +1154,29 @@ struct PresentationWorkspaceView: View {
     private var liveSelfCaptionCard: some View {
         let blocks = model.displayConversation.map { ConversationBlocks.make($0) } ?? []
         let latestBlocks = Array(blocks.suffix(3).reversed())
+        let effectiveLiveHeight: CGFloat = max(
+            CGFloat(liveCaptionSlotHeight),
+            min(200, CGFloat(model.sttAppearance.latestFontSize) * 3.6 + 38)
+        )
+        let latestTextSize: CGFloat = max(12, min(32, CGFloat(model.sttAppearance.fontSize)))
+        let olderTextSize: CGFloat = max(11, latestTextSize - 3)
+        let translationTextSize: CGFloat = max(11, latestTextSize - 2)
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Label("실시간 내 발화 자막 · 역번역", systemImage: "waveform")
+                Label("실시간 STT 자막 · 역번역", systemImage: "waveform")
                     .font(.subheadline.bold())
                     .foregroundStyle(.blue)
                 Spacer()
+                Text("\(Int(model.sttAppearance.fontSize))pt")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                PanelFontButton(
+                    title: "STT 자막",
+                    value: $model.sttAppearance.fontSize,
+                    range: STTAppearance.minFontSize...STTAppearance.maxFontSize,
+                    defaultValue: 18
+                )
                 if model.listening {
                     Text(model.micMuted ? "음소거됨" : "수신 중")
                         .font(.caption2.bold())
@@ -1107,45 +1190,85 @@ struct PresentationWorkspaceView: View {
                 liveSTT: model.liveSTT,
                 appearance: model.sttAppearance,
                 followLive: model.followLive,
-                compact: true
+                isListening: model.listening,
+                compact: false,
+                alwaysReserveSpace: true,
+                fixedHeight: effectiveLiveHeight,
+                idlePlaceholder: model.listening ? "음성 대기 중… 한 문장이 온전히 여기에 고정 표시됩니다." : "발표를 시작하면 실시간 STT 자막이 흔들림 없이 표시됩니다."
             )
 
-            if latestBlocks.isEmpty && model.liveSTT.text.isEmpty {
-                Text("발표를 시작하면 내가 말하는 외국어가 STT로 어떻게 인식되는지와 역번역이 실시간 표시됩니다.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(latestBlocks.enumerated()), id: \.element.id) { idx, block in
-                            let cleanText = block.text
-                                .replacingOccurrences(of: "[마이크]", with: "")
-                                .replacingOccurrences(of: "[Mac 재생음]", with: "")
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(cleanText)
-                                    .font(.system(size: idx == 0 ? 14 : 12, weight: idx == 0 ? .semibold : .regular))
-                                    .foregroundStyle(idx == 0 ? .primary : .secondary)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                if let translated = block.translation?.translated, !translated.isEmpty {
-                                    Text("→ \(translated)")
-                                        .font(.caption)
-                                        .foregroundStyle(.teal)
+            Group {
+                if latestBlocks.isEmpty {
+                    Text("발화가 완료되면 최근 원문과 역번역이 이 고정 영역에 표시됩니다.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(latestBlocks.enumerated()), id: \.element.id) { idx, block in
+                                let cleanText = block.text
+                                    .replacingOccurrences(of: "[마이크]", with: "")
+                                    .replacingOccurrences(of: "[Mac 재생음]", with: "")
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(cleanText)
+                                        .font(.system(size: idx == 0 ? latestTextSize : olderTextSize, weight: idx == 0 ? .semibold : .regular))
+                                        .foregroundStyle(idx == 0 ? .primary : .secondary)
+                                        .multilineTextAlignment(.leading)
+                                        .lineLimit(nil)
+                                        .lineSpacing(3)
                                         .textSelection(.enabled)
                                         .frame(maxWidth: .infinity, alignment: .leading)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    if let translated = block.translation?.translated, !translated.isEmpty {
+                                        Text("→ \(translated)")
+                                            .font(.system(size: idx == 0 ? translationTextSize : max(11, translationTextSize - 2)))
+                                            .foregroundStyle(.teal)
+                                            .multilineTextAlignment(.leading)
+                                            .lineLimit(nil)
+                                            .lineSpacing(2)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
                                 }
+                                .padding(8)
+                                .background(Color(nsColor: .textBackgroundColor).opacity(idx == 0 ? 1.0 : 0.72), in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(idx == 0 ? 0.24 : 0.14), lineWidth: 0.8))
                             }
-                            .padding(8)
-                            .background(idx == 0 ? Color.blue.opacity(0.08) : Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
                         }
                     }
                 }
-                .frame(minHeight: 110, maxHeight: 175)
             }
+            .frame(height: 146)
+            .transaction { $0.animation = nil }
+
+            // Drag handle to resize the live STT slot height
+            HStack {
+                Spacer()
+                Capsule()
+                    .fill(Color.secondary.opacity(0.30))
+                    .frame(width: 38, height: 3)
+                Spacer()
+            }
+            .frame(height: 7)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        if liveCaptionDragStart == nil { liveCaptionDragStart = liveCaptionSlotHeight }
+                        let base = liveCaptionDragStart ?? liveCaptionSlotHeight
+                        liveCaptionSlotHeight = min(240, max(88, base + value.translation.height))
+                    }
+                    .onEnded { _ in liveCaptionDragStart = nil }
+            )
+            .help("위아래로 드래그하여 실시간 STT 자막 창 높이를 조절합니다")
         }
     }
 
@@ -1620,31 +1743,57 @@ struct PresentationWorkspaceView: View {
     // MARK: - Live Q&A Mode Right Column
 
     private var qaCompanionView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+        let qCount = session.resolvedQuestionNotes.count
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
                 Label("Q&A 실시간 대응 중", systemImage: "bubble.left.and.exclamationmark.bubble.right.fill")
                     .font(.subheadline.bold())
                     .foregroundStyle(.teal)
                 Spacer()
                 Button {
-                    Task { await model.advise() }
+                    model.captureRecentQuestionAsPostIt()
                 } label: {
-                    Label("답변 추천", systemImage: "sparkles")
+                    Label("방금 질문 저장", systemImage: "pin.fill")
                 }
                 .controlSize(.mini)
-                .disabled(model.generating)
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .help("방금 나온 질문의 음성과 텍스트를 질문기록에 따로 저장 (⌥⌘Q)")
+
+                Button {
+                    qaShowingPostIts.toggle()
+                } label: {
+                    Label(qCount > 0 ? "질문기록 (\(qCount))" : "질문기록", systemImage: "note.text")
+                }
+                .controlSize(.mini)
+                .buttonStyle(.bordered)
+                .tint(qaShowingPostIts ? .orange : .secondary)
+
+                if !qaShowingPostIts {
+                    Button {
+                        Task { await model.advise() }
+                    } label: {
+                        Label("답변 추천", systemImage: "sparkles")
+                    }
+                    .controlSize(.mini)
+                    .disabled(model.generating)
+                }
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(Color.teal.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
-            VSplitView {
-                TranslationView(model: model)
-                    .frame(minHeight: 160, idealHeight: 230)
-                    .padding(.bottom, 6)
+            if qaShowingPostIts {
+                PresentationQuestionNotesView(model: model)
+            } else {
+                VSplitView {
+                    TranslationView(model: model)
+                        .frame(minHeight: 160, idealHeight: 230)
+                        .padding(.bottom, 6)
 
-                CoachView(model: model)
-                    .frame(minHeight: 180, idealHeight: 260)
-                    .padding(.top, 6)
+                    CoachView(model: model)
+                        .frame(minHeight: 180, idealHeight: 260)
+                        .padding(.top, 6)
+                }
             }
         }
     }

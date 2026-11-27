@@ -113,6 +113,27 @@ enum ConversationExport {
             }
         }
 
+        if let captures = conversation.screenCaptures, !captures.isEmpty {
+            lines.append("")
+            lines.append("## 강의 화면 기록 (\(captures.count)장)")
+            lines.append("")
+            for (idx, cap) in captures.sorted(by: { $0.capturedAt < $1.capturedAt }).enumerated() {
+                let timeText = cap.capturedAt.formatted(.dateTime.hour().minute().second())
+                lines.append("### 화면 \(idx + 1) · \(timeText) (\(cap.appName) — \(cap.windowTitle))")
+                lines.append("- 파일: `\(cap.filename)`")
+                if !cap.transcriptExcerpt.isEmpty {
+                    lines.append("- 설명 원문: \(cap.transcriptExcerpt)")
+                }
+                if let trans = cap.translationExcerpt, !trans.isEmpty {
+                    lines.append("- 번역: \(trans)")
+                }
+                if !cap.userNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    lines.append("- 학습 메모: \(cap.userNote)")
+                }
+                lines.append("")
+            }
+        }
+
         let allKeywords = conversation.allKeywords
         if !allKeywords.isEmpty {
             let relatedMap = conversation.allRelatedKeywords

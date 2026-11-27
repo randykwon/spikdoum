@@ -53,96 +53,111 @@ struct LiveSTTCaptionRow: View {
     @ObservedObject var liveSTT: LiveSTTDisplayStore
     let appearance: STTAppearance
     let followLive: Bool
+    var isListening: Bool = false
     var showSourceBadge: Bool = true
     var sideBySideWidths: (stt: CGFloat, translation: CGFloat, coach: CGFloat)? = nil
     var showTranslationColumn: Bool = false
     var showCoachColumn: Bool = false
     var compact: Bool = false
+    var alwaysReserveSpace: Bool = false
+    var fixedHeight: CGFloat? = nil
+    var idlePlaceholder: String = "실시간 음성 대기 중…"
     var onTextChange: (() -> Void)? = nil
 
+    private func captionTextContent(displayText: String, hasLiveText: Bool) -> some View {
+        let textSize: CGFloat = hasLiveText ? appearance.latestFontSize : 12.5
+        let textWeight: Font.Weight = hasLiveText ? .semibold : .regular
+        let textColor: Color = hasLiveText ? Color.primary : Color.secondary
+        let spacing: CGFloat = compact ? 3 : (appearance.fontSize <= 13 ? 3 : 5)
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(displayText)
+                        .font(.system(size: textSize, weight: textWeight))
+                        .foregroundStyle(textColor)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(nil)
+                        .lineSpacing(spacing)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Color.clear.frame(height: 1).id("live-stt-tail")
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .onChange(of: displayText) { _, next in
+                // Only auto-scroll when text is long enough to approach/exceed the fixed caption box;
+                // avoids macOS NSScrollView vertical micro-bounces on short 1-2 line captions.
+                guard hasLiveText, (next.contains("\n") || next.count > 75) else { return }
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) {
+                    proxy.scrollTo("live-stt-tail", anchor: .bottom)
+                }
+            }
+        }
+    }
+
     var body: some View {
-        Group {
-            if followLive && !liveSTT.text.isEmpty {
-                let isMic = liveSTT.sourceTag == "마이크"
-                let accent: Color = isMic ? .teal : .blue
-                let innerPad: CGFloat = compact ? 7 : 10
-                VStack(alignment: .leading, spacing: compact ? 4 : 6) {
+        let liveText = liveSTT.displayText
+        let liveTag = liveSTT.displaySourceTag
+        // Fixed live windows always show live/committed STT text even when history scroll is paused.
+        let hasLiveText = (followLive || alwaysReserveSpace) && !liveText.isEmpty
+        let activeIndicator = isListening || hasLiveText
+        let isMic = liveTag == "마이크"
+        let innerPad: CGFloat = compact ? 6 : 9
+        let steadySurface: Color = Color(nsColor: .textBackgroundColor)
+        let steadyBorder: Color = Color.secondary.opacity(0.24)
+        let statusLabel: String = {
+            if isListening { return "실시간 인식 중" }
+            if hasLiveText { return "최근 인식 문장" }
+            return followLive ? "실시간 고정 창" : "읽기 고정됨"
+        }()
+
+        return Group {
+            if hasLiveText || alwaysReserveSpace {
+                VStack(alignment: .leading, spacing: compact ? 3 : 5) {
                     HStack(spacing: 6) {
                         HStack(spacing: 4) {
                             Circle()
-                                .fill(Color.white)
-                                .frame(width: 5, height: 5)
-                            Text("실시간 인식 중")
-                                .font(.system(size: 9, weight: .bold))
+                                .fill(activeIndicator ? Color.green : Color.secondary.opacity(0.45))
+                                .frame(width: 6, height: 6)
+                            Text(statusLabel)
+                                .font(.system(size: 10, weight: .semibold))
                         }
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .foregroundStyle(Color.white)
-                        .background(accent, in: Capsule())
+                        .foregroundStyle(Color.secondary)
+                        .background(Color.secondary.opacity(0.10), in: Capsule())
 
-                        if showSourceBadge, let tag = liveSTT.sourceTag {
+                        if showSourceBadge, let tag = liveTag, (hasLiveText || isListening) {
                             Label(tag == "마이크" ? "내 목소리" : "Mac 소리", systemImage: isMic ? "mic.fill" : "speaker.wave.2.fill")
-                                .font(.caption2.bold())
+                                .font(.caption2.weight(.medium))
+                                .lineLimit(1)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .foregroundStyle(accent)
-                                .background(accent.opacity(0.14), in: Capsule())
+                                .foregroundStyle(Color.secondary)
+                                .background(Color.secondary.opacity(0.10), in: Capsule())
                         }
                         Spacer(minLength: 4)
                     }
+                    .frame(height: 18)
 
-                    if let widths = sideBySideWidths {
-                        HStack(alignment: .top, spacing: 10) {
-                            Text(liveSTT.text)
-                                .font(.system(size: appearance.latestFontSize, weight: .semibold))
-                                .foregroundStyle(appearance.latestText.color)
-                                .lineSpacing(compact ? 2 : (appearance.fontSize <= 13 ? 3 : 5))
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .padding(innerPad)
-                                .frame(width: widths.stt, alignment: .topLeading)
-                                .background(appearance.latestBackground.color.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
-
-                            if showTranslationColumn && widths.translation > 0 {
-                                HStack(spacing: 5) {
-                                    ProgressView().controlSize(.mini)
-                                    Text("발화 완료 시 즉시 번역…")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .topLeading)
-                                .padding(innerPad)
-                                .frame(width: widths.translation, alignment: .topLeading)
-                                .background((isMic ? Color.teal : Color.purple).opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                            }
-
-                            if showCoachColumn && widths.coach > 0 {
-                                Text("—")
-                                    .font(.caption)
-                                    .foregroundStyle(.quaternary)
-                                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                                    .padding(innerPad)
-                                    .frame(width: widths.coach, alignment: .topLeading)
-                                    .background(Color.secondary.opacity(0.03), in: RoundedRectangle(cornerRadius: 8))
-                            }
-                        }
-                        .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text(liveSTT.text)
-                            .font(.system(size: appearance.latestFontSize, weight: .semibold))
-                            .foregroundStyle(appearance.latestText.color)
-                            .lineSpacing(compact ? 2 : (appearance.fontSize <= 13 ? 3 : 5))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, innerPad)
-                            .padding(.vertical, compact ? 5 : 8)
-                            .background(appearance.latestBackground.color.opacity(0.92), in: RoundedRectangle(cornerRadius: 8))
-                    }
+                    captionTextContent(displayText: hasLiveText ? liveText : idlePlaceholder, hasLiveText: hasLiveText)
+                        .padding(.horizontal, innerPad)
+                        .padding(.vertical, compact ? 4 : 6)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .background(steadySurface, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(steadyBorder, lineWidth: 0.8))
                 }
-                .padding(compact ? 7 : 10)
-                .background(accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 11))
-                .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(accent.opacity(0.65), style: StrokeStyle(lineWidth: 1.4, dash: [5, 3])))
+                .padding(compact ? 6 : 8)
+                .frame(height: fixedHeight, alignment: .topLeading)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(steadyBorder, lineWidth: 1))
+                .clipped()
+                .transaction { $0.animation = nil }
             }
         }
-        .onChange(of: liveSTT.text) { _, next in
+        .onChange(of: liveText) { _, next in
             if followLive && !next.isEmpty {
                 onTextChange?()
             }
@@ -154,7 +169,7 @@ private struct EmptyStateUnlessLive<Content: View>: View {
     @ObservedObject var liveSTT: LiveSTTDisplayStore
     @ViewBuilder let content: () -> Content
     var body: some View {
-        if liveSTT.text.isEmpty {
+        if !liveSTT.hasDisplayText {
             content()
         }
     }
@@ -162,13 +177,17 @@ private struct EmptyStateUnlessLive<Content: View>: View {
 
 struct LinkedConversationView: View {
     @ObservedObject var model: AppModel
+    var coachInSeparatePanel: Bool = false
     @AppStorage("linkedRowStyle") private var rowStyleRaw = LinkedRowStyle.sideBySide.rawValue
     @AppStorage("linkedColumnBalance") private var columnBalanceRaw = LinkedColumnBalance.translationWide.rawValue
     @AppStorage("linkedNewestFirst") private var newestFirst = false
     @AppStorage("linkedCompactDensity") private var compactDensity = false
     @AppStorage("pinLatestSpotlight") private var pinLatestSpotlight = true
     @AppStorage("pinnedSpotlightCount") private var pinnedSpotlightCount = 1
+    @AppStorage("showPinnedRecentCardV1") private var showPinnedRecentCard = true
+    @AppStorage("pinnedLiveStageHeightV2") private var pinnedStageHeight: Double = 305
     @AppStorage("linkedControlHeaderCollapsedV1") private var controlHeaderCollapsed = false
+    @State private var stageDragStartHeight: Double? = nil
     @State private var showHistory = false
     @State private var showingAppearance = false
     @State private var speakerFilter: LinkedSpeakerFilter = .all
@@ -197,8 +216,12 @@ struct LinkedConversationView: View {
         !model.simpleFastMode && model.panelLayout.isVisible(.coach)
     }
 
-    private var visibleColumnCount: Int {
-        (effectiveShowSTT ? 1 : 0) + (effectiveShowTranslation ? 1 : 0) + (effectiveShowCoach ? 1 : 0)
+    private var effectiveShowInlineCoach: Bool {
+        effectiveShowCoach && !coachInSeparatePanel
+    }
+
+    private var visiblePrimaryColumnCount: Int {
+        (effectiveShowSTT ? 1 : 0) + (effectiveShowTranslation ? 1 : 0)
     }
 
     var body: some View {
@@ -218,8 +241,9 @@ struct LinkedConversationView: View {
                         .buttonStyle(.plain)
                         .help("좌우/상하 배치 · 최근 고정 · 검색 바 펼치기")
                         Spacer()
-                        if model.translating { ProgressView().controlSize(.mini) }
+                        ProgressView().controlSize(.mini).opacity(model.translating ? 1 : 0).frame(width: 14, height: 14)
                     }
+                    .frame(height: 22)
                 } else {
                     controlHeader
                 }
@@ -228,14 +252,14 @@ struct LinkedConversationView: View {
                 searchBar
             }
             GeometryReader { geo in
-                let widths = columnWidths(totalWidth: max(320, geo.size.width - 28))
+                let widths = columnWidths(totalWidth: max(260, geo.size.width - 52))
                 VStack(alignment: .leading, spacing: 6) {
                     if rowStyle == .sideBySide {
                         columnHeaders(widths: widths)
                     }
                     ZStack(alignment: newestFirst ? .topTrailing : .bottomTrailing) {
                         linkedTimeline(widths: widths)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         if !model.followLive {
                             Button {
                                 model.resumeReading()
@@ -267,14 +291,13 @@ struct LinkedConversationView: View {
 
     private func columnWidths(totalWidth: CGFloat) -> (stt: CGFloat, translation: CGFloat, coach: CGFloat) {
         let w = columnBalance.weights
-        let count = max(1, visibleColumnCount)
+        let count = max(1, visiblePrimaryColumnCount)
         let spacing = CGFloat(max(0, count - 1)) * 10
         let usable = max(220, totalWidth - spacing)
         let sttW: CGFloat = effectiveShowSTT ? w.stt : 0
         let transW: CGFloat = effectiveShowTranslation ? w.translation : 0
-        let coachW: CGFloat = effectiveShowCoach ? w.coach : 0
-        let sum = max(0.01, sttW + transW + coachW)
-        return (usable * sttW / sum, usable * transW / sum, usable * coachW / sum)
+        let sum = max(0.01, sttW + transW)
+        return (usable * sttW / sum, usable * transW / sum, 0)
     }
 
     private var controlHeader: some View {
@@ -327,7 +350,7 @@ struct LinkedConversationView: View {
             .buttonStyle(.plain)
             .help(pinLatestSpotlight ? "최근 원문·번역을 상단에 고정해 스크롤 없이 편안하게 봅니다 (클릭하여 해제)" : "최근 원문·번역을 상단에 고정해 스크롤 없이 보기")
 
-            if pinLatestSpotlight {
+            if pinLatestSpotlight && showPinnedRecentCard {
                 Button {
                     pinnedSpotlightCount = pinnedSpotlightCount == 1 ? 2 : 1
                 } label: {
@@ -340,7 +363,7 @@ struct LinkedConversationView: View {
                 }
                 .buttonStyle(.plain)
                 .help("상단 고정 영역에 표시할 최근 문장 수 전환 (1문장 / 2문장)")
-            } else {
+            } else if !pinLatestSpotlight {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { newestFirst.toggle() }
                 } label: {
@@ -406,7 +429,7 @@ struct LinkedConversationView: View {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { model.panelLayout.toggle(.coach, includeCoach: true) }
                 } label: {
-                    Label("조언", systemImage: "sparkles")
+                    Label(coachInSeparatePanel ? "대화 코치" : "조언", systemImage: "sparkles")
                         .font(.caption2.weight(.medium))
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
@@ -415,13 +438,19 @@ struct LinkedConversationView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(effectiveShowCoach && !model.panelLayout.canHide(.coach, includeCoach: true))
-                .help(effectiveShowCoach ? "조언 열 숨기기 (원문·번역 넓게 보기)" : "조언 열 표시")
+                .help(effectiveShowCoach ? (coachInSeparatePanel ? "오른쪽 대화 코치 패널 숨기기" : "조언 열 숨기기 (원문·번역 넓게 보기)") : (coachInSeparatePanel ? "오른쪽에 대화 코치 패널 독립 표시" : "조언 열 표시"))
             }
 
-            if model.translating { ProgressView().controlSize(.mini) }
+            ProgressView()
+                .controlSize(.mini)
+                .opacity(model.translating ? 1 : 0)
+                .frame(width: 14, height: 14)
 
             Menu {
                 Toggle("전체 기록 보기", isOn: $showHistory)
+                if pinLatestSpotlight {
+                    Toggle("고정 최근 번역 창 표시", isOn: $showPinnedRecentCard)
+                }
                 Button("원문 색상 · 글자 설정") { showingAppearance = true }
                 Divider()
                 Button("번역 다시 시도") { model.translateLatest() }.disabled(model.translating)
@@ -455,6 +484,7 @@ struct LinkedConversationView: View {
             .buttonStyle(.plain)
             .help("보기 옵션 바 접기")
         }
+        .frame(height: 24)
         .controlSize(.small)
     }
 
@@ -483,6 +513,8 @@ struct LinkedConversationView: View {
                     Label("원문", systemImage: "waveform")
                         .font(.caption.bold())
                         .foregroundStyle(.blue)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                     Spacer(minLength: 4)
                     PanelFontButton(title: "STT 원문", value: $model.sttAppearance.fontSize, range: STTAppearance.minFontSize...STTAppearance.maxFontSize, defaultValue: 20)
                     if model.panelLayout.canHide(.stt, includeCoach: !model.simpleFastMode) {
@@ -497,7 +529,7 @@ struct LinkedConversationView: View {
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .frame(width: widths.stt, alignment: .leading)
+                .frame(width: widths.stt, height: 24, alignment: .leading)
                 .background(Color.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
             }
 
@@ -506,6 +538,8 @@ struct LinkedConversationView: View {
                     Label("\(model.targetLanguageName) 번역", systemImage: "character.bubble")
                         .font(.caption.bold())
                         .foregroundStyle(.purple)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                     Text(model.translationError ?? model.translationStatus)
                         .font(.caption2)
                         .foregroundStyle(model.translationError == nil ? Color.secondary : Color.orange)
@@ -525,34 +559,11 @@ struct LinkedConversationView: View {
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .frame(width: widths.translation, alignment: .leading)
+                .frame(width: widths.translation, height: 24, alignment: .leading)
                 .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
             }
-
-            if effectiveShowCoach {
-                HStack(spacing: 6) {
-                    Label("코치 · 조언", systemImage: "sparkles")
-                        .font(.caption.bold())
-                        .foregroundStyle(.green)
-                    if model.generating { ProgressView().controlSize(.mini) }
-                    Spacer(minLength: 4)
-                    PanelFontButton(title: "대화 코치", value: $model.panelTypography.advice, defaultValue: 18)
-                    if model.panelLayout.canHide(.coach, includeCoach: true) {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.15)) { model.panelLayout.setVisible(.coach, false, includeCoach: true) }
-                        } label: {
-                            Image(systemName: "xmark").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("코치 열 숨기기")
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .frame(width: widths.coach, alignment: .leading)
-                .background(Color.green.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-            }
         }
+        .frame(height: 24)
         .padding(.horizontal, 10)
     }
 
@@ -587,8 +598,9 @@ struct LinkedConversationView: View {
                 }
                 let usePinnedStage = pinLatestSpotlight && trimmedQuery.isEmpty
                 let pinCount = max(1, min(2, pinnedSpotlightCount))
-                let pinnedBlocks = usePinnedStage ? Array(filteredBlocks.suffix(pinCount).reversed()) : []
-                let historySource = usePinnedStage ? Array(filteredBlocks.dropLast(pinnedBlocks.count)) : filteredBlocks
+                let showPinnedCardArea = usePinnedStage && (showPinnedRecentCard || !effectiveShowSTT)
+                let pinnedBlocks = showPinnedCardArea ? Array(filteredBlocks.suffix(pinCount).reversed()) : []
+                let historySource = showPinnedCardArea ? Array(filteredBlocks.dropLast(pinnedBlocks.count)) : filteredBlocks
                 let orderedBlocks = (usePinnedStage || newestFirst) ? Array(historySource.reversed()) : historySource
                 let latestBlockID = allBlocks.last?.id
                 let linkedAdviceIDs = Set(allBlocks.flatMap { $0.advice.map(\.id) })
@@ -596,28 +608,78 @@ struct LinkedConversationView: View {
                 let lastBlockIsPendingInPlace = allBlocks.last?.translation == nil && !model.translationSource.isEmpty
                 let showSeparatePending = model.followLive
                     && (!lastBlockIsPendingInPlace && (model.translationPreview != nil || (!model.translationSource.isEmpty && allBlocks.isEmpty))
-                        || (effectiveShowCoach && (!model.liveResponse.isEmpty || model.generating)))
+                        || (effectiveShowInlineCoach && (!model.liveResponse.isEmpty || model.generating)))
                 let anchorID = newestFirst ? "linked-top" : "linked-bottom"
                 let anchorPos: UnitPoint = newestFirst ? .top : .bottom
 
                 VStack(alignment: .leading, spacing: 8) {
                     if usePinnedStage {
-                        // FIXED NON-SCROLLING RECENT STAGE: eyes stay locked on one calm spot without scroll jumping.
-                        VStack(alignment: .leading, spacing: compactDensity ? 5 : 7) {
+                        // FIXED-HEIGHT ZERO-JITTER LIVE STAGE: generous full-sentence height + inline font controls.
+                        let liveSlotHeight: CGFloat = max(
+                            compactDensity ? 114 : 132,
+                            min(220, CGFloat(model.sttAppearance.latestFontSize) * 4.0 + 42)
+                        )
+                        let minStage = Double(liveSlotHeight) + (pinCount == 2 ? 170 : 120)
+                        let expandedStageHeight = min(560, max(minStage, pinnedStageHeight + (pinCount == 2 ? 75 : 0)))
+                        let stageHeight: Double = showPinnedCardArea
+                            ? expandedStageHeight
+                            : Double(liveSlotHeight) + 42
+                        VStack(alignment: .leading, spacing: compactDensity ? 5 : 6) {
                             HStack(spacing: 6) {
-                                Label("최근 내용 고정", systemImage: "pin.fill")
+                                Label(showPinnedCardArea ? "실시간 STT · 번역 고정 창" : "실시간 STT 고정 창", systemImage: "pin.fill")
                                     .font(.caption2.bold())
                                     .foregroundStyle(Color.accentColor)
-                                Text("스크롤 없이 이 자리에 실시간 갱신")
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                Text("높이 고정 · 흔들림 없이 실시간 갱신")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
-                                Spacer()
-                                if !orderedBlocks.isEmpty {
-                                    Text("아래 이전 기록 \(orderedBlocks.count)건")
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                if effectiveShowCoach && model.generating {
+                                    Text("· 조언 생성 중")
+                                        .font(.caption2)
+                                        .foregroundStyle(.green)
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                                Spacer(minLength: 4)
+                                if effectiveShowSTT {
+                                    Button {
+                                        showPinnedRecentCard.toggle()
+                                    } label: {
+                                        Label(showPinnedRecentCard ? "번역 창 숨기기" : "번역 창 보기", systemImage: showPinnedRecentCard ? "eye.slash" : "eye")
+                                            .font(.caption2.weight(.medium))
+                                            .lineLimit(1)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .foregroundStyle(showPinnedRecentCard ? Color.secondary : Color.purple)
+                                            .background(showPinnedRecentCard ? Color.secondary.opacity(0.10) : Color.purple.opacity(0.14), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                    .help(showPinnedRecentCard ? "아래 최근 고정 번역 창을 숨기고 실시간 STT 창만 남깁니다" : "숨겨둔 최근 고정 번역 창을 다시 표시합니다")
+                                }
+                                HStack(spacing: 4) {
+                                    Text("STT \(Int(model.sttAppearance.fontSize))pt")
                                         .font(.caption2.monospacedDigit())
                                         .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                    PanelFontButton(title: "STT 원문", value: $model.sttAppearance.fontSize, range: STTAppearance.minFontSize...STTAppearance.maxFontSize, defaultValue: 20)
+                                    if effectiveShowTranslation {
+                                        PanelFontButton(title: "번역", value: $model.panelTypography.translation, defaultValue: 19)
+                                    }
+                                }
+                                if !orderedBlocks.isEmpty {
+                                    Text("· 이전 \(orderedBlocks.count)건")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
                                 }
                             }
+                            .frame(height: 20)
                             .padding(.horizontal, 4)
 
                             if effectiveShowSTT {
@@ -625,49 +687,102 @@ struct LinkedConversationView: View {
                                     liveSTT: model.liveSTT,
                                     appearance: model.sttAppearance,
                                     followLive: model.followLive,
+                                    isListening: model.listening,
                                     sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
                                     showTranslationColumn: effectiveShowTranslation,
                                     showCoachColumn: effectiveShowCoach,
-                                    compact: compactDensity
+                                    compact: compactDensity,
+                                    alwaysReserveSpace: true,
+                                    fixedHeight: liveSlotHeight,
+                                    idlePlaceholder: model.listening ? "음성 대기 중… 말하는 즉시 한 문장이 온전히 여기에 고정 표시됩니다." : "듣기를 시작하면 실시간 STT 결과가 흔들림 없이 여기에 표시됩니다."
                                 )
                             }
 
-                            if pinnedBlocks.isEmpty {
-                                EmptyStateUnlessLive(liveSTT: model.liveSTT) {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: "waveform")
-                                            .foregroundStyle(.secondary)
-                                        Text(conversation.transcript.isEmpty ? "대화를 시작하면 최근 원문과 번역이 스크롤 없이 여기에 고정 표시됩니다." : "표시할 최근 발언이 없습니다.")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                            if showPinnedCardArea {
+                                ScrollViewReader { pinnedProxy in
+                                    ScrollView(.vertical, showsIndicators: true) {
+                                        VStack(alignment: .leading, spacing: compactDensity ? 5 : 7) {
+                                            if pinnedBlocks.isEmpty {
+                                                HStack(spacing: 8) {
+                                                    Image(systemName: "waveform")
+                                                        .foregroundStyle(.secondary)
+                                                    Text(conversation.transcript.isEmpty ? "발화가 완료되면 최근 원문과 번역이 이 고정 영역에 안정적으로 표시됩니다." : "표시할 최근 발언이 없습니다.")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                                                .padding(.horizontal, 12)
+                                                .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 9))
+                                            } else {
+                                                ForEach(pinnedBlocks) { block in
+                                                    let isLatest = block.id == latestBlockID
+                                                    linkedRow(
+                                                        block,
+                                                        conversation: conversation,
+                                                        latest: isLatest,
+                                                        inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
+                                                        widths: widths,
+                                                        showInlineAdvice: false,
+                                                        pinnedCardMinHeight: 56,
+                                                        onHidePinnedCard: effectiveShowSTT ? { showPinnedRecentCard = false } : nil
+                                                    )
+                                                }
+                                            }
+                                            Color.clear.frame(height: 1).id("pinned-stage-bottom")
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .topLeading)
                                     }
-                                    .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
-                                    .padding(.horizontal, 12)
-                                    .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                                    .frame(maxHeight: .infinity)
+                                    .onChange(of: pinnedBlocks.first?.text) { _, next in
+                                        guard model.followLive, let next,
+                                              (next.count > 140 || next.filter({ $0 == "\n" }).count >= 3) else { return }
+                                        var t = Transaction()
+                                        t.disablesAnimations = true
+                                        withTransaction(t) {
+                                            pinnedProxy.scrollTo("pinned-stage-bottom", anchor: .bottom)
+                                        }
+                                    }
                                 }
-                            } else {
-                                ForEach(pinnedBlocks) { block in
-                                    let isLatest = block.id == latestBlockID
-                                    linkedRow(
-                                        block,
-                                        conversation: conversation,
-                                        latest: isLatest,
-                                        inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
-                                        widths: widths
-                                    )
-                                }
-                            }
-
-                            if showSeparatePending {
-                                pendingBanner
                             }
                         }
                         .padding(8)
-                        .background(Color.accentColor.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.accentColor.opacity(0.22), lineWidth: 1))
+                        .frame(height: stageHeight, alignment: .topLeading)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.secondary.opacity(0.22), lineWidth: 1))
                         .padding(.horizontal, 2)
+                        .transaction { $0.animation = nil }
 
-                        if !orderedBlocks.isEmpty || (effectiveShowCoach && !unlinkedAdvice.isEmpty) {
+                        if showPinnedCardArea {
+                            // Subtle drag handle to adjust the locked live STT stage height
+                            HStack {
+                                Spacer()
+                                Capsule()
+                                    .fill(Color.secondary.opacity(0.32))
+                                    .frame(width: 44, height: 3.5)
+                                Spacer()
+                            }
+                            .frame(height: 8)
+                            .contentShape(Rectangle())
+                            .onHover { hovering in
+                                if hovering { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+                            }
+                            .gesture(
+                                DragGesture(minimumDistance: 1)
+                                    .onChanged { value in
+                                        if stageDragStartHeight == nil {
+                                            stageDragStartHeight = pinnedStageHeight
+                                        }
+                                        let base = stageDragStartHeight ?? pinnedStageHeight
+                                        pinnedStageHeight = min(520, max(200, base + value.translation.height))
+                                    }
+                                    .onEnded { _ in
+                                        stageDragStartHeight = nil
+                                    }
+                            )
+                            .help("위아래로 드래그하여 실시간 고정 창 높이를 조절합니다")
+                        }
+
+                        if !orderedBlocks.isEmpty || (effectiveShowInlineCoach && !unlinkedAdvice.isEmpty) {
                             HStack(spacing: 6) {
                                 Text("이전 대화 기록")
                                     .font(.caption2.bold())
@@ -692,6 +807,7 @@ struct LinkedConversationView: View {
                                         liveSTT: model.liveSTT,
                                         appearance: model.sttAppearance,
                                         followLive: model.followLive,
+                                        isListening: model.listening,
                                         sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
                                         showTranslationColumn: effectiveShowTranslation,
                                         showCoachColumn: effectiveShowCoach,
@@ -721,11 +837,12 @@ struct LinkedConversationView: View {
                                         conversation: conversation,
                                         latest: isLatest,
                                         inPlaceStreaming: isLatest && block.translation == nil && model.followLive,
-                                        widths: widths
+                                        widths: widths,
+                                        showInlineAdvice: effectiveShowInlineCoach
                                     )
                                     .id(block.id)
                                 }
-                                if effectiveShowCoach && !unlinkedAdvice.isEmpty && trimmedQuery.isEmpty {
+                                if effectiveShowInlineCoach && !unlinkedAdvice.isEmpty && trimmedQuery.isEmpty {
                                     VStack(alignment: .leading, spacing: 6) {
                                         Text("추가 조언 기록 (\(unlinkedAdvice.count))").font(.caption.bold()).foregroundStyle(.secondary)
                                         ForEach(unlinkedAdvice) { item in
@@ -742,6 +859,7 @@ struct LinkedConversationView: View {
                                         liveSTT: model.liveSTT,
                                         appearance: model.sttAppearance,
                                         followLive: model.followLive,
+                                        isListening: model.listening,
                                         sideBySideWidths: rowStyle == .sideBySide ? widths : nil,
                                         showTranslationColumn: effectiveShowTranslation,
                                         showCoachColumn: effectiveShowCoach,
@@ -759,7 +877,8 @@ struct LinkedConversationView: View {
                             .padding(.horizontal, 2)
                             .padding(.vertical, 2)
                         }
-                        .readingScrollControl(model)
+                        .readingScrollControl(model, enabled: !usePinnedStage)
+                        .transaction { $0.animation = nil }
                         .onAppear { if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
                         .onChange(of: model.displayConversation?.transcript) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
                         .onChange(of: model.displayConversation?.translations?.count) { _, _ in if !usePinnedStage && model.followLive { proxy.scrollTo(anchorID, anchor: anchorPos) } }
@@ -785,7 +904,8 @@ struct LinkedConversationView: View {
         latest: Bool,
         sourceTag: String?,
         isMic: Bool,
-        displaySTT: String
+        displaySTT: String,
+        onHidePinnedCard: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 6) {
             Button {
@@ -885,7 +1005,20 @@ struct LinkedConversationView: View {
                 .buttonStyle(.plain)
                 .help("원문과 번역 함께 복사")
             }
+
+            if let onHidePinnedCard {
+                Button(action: onHidePinnedCard) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                        .background(Color.secondary.opacity(0.10), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .help("이 고정 번역 창 숨기기")
+            }
         }
+        .frame(height: 18)
     }
 
     @ViewBuilder
@@ -893,15 +1026,22 @@ struct LinkedConversationView: View {
         if let entry = block.translation {
             Text(entry.translated)
                 .font(.system(size: model.panelTypography.translation, weight: .medium))
+                .multilineTextAlignment(.leading)
+                .lineLimit(nil)
                 .lineSpacing(compactDensity ? 3 : 5)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
         } else if inPlaceStreaming && !model.liveTranslation.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.liveTranslation)
                     .font(.system(size: model.panelTypography.translation, weight: .medium))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(nil)
                     .lineSpacing(compactDensity ? 3 : 5)
                     .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 5) {
                     ProgressView().controlSize(.mini)
                     Text("실시간 번역 중…").font(.caption2).foregroundStyle(.secondary)
@@ -927,43 +1067,49 @@ struct LinkedConversationView: View {
         conversation: Conversation,
         latest: Bool,
         inPlaceStreaming: Bool,
-        widths: (stt: CGFloat, translation: CGFloat, coach: CGFloat)
+        widths: (stt: CGFloat, translation: CGFloat, coach: CGFloat),
+        showInlineAdvice: Bool = true,
+        pinnedCardMinHeight: CGFloat? = nil,
+        onHidePinnedCard: (() -> Void)? = nil
     ) -> some View {
         let selected = model.selectedConversationBlockID.map { $0 == block.id } ?? block.spans.contains { $0.id == model.selectedLiveBlockID }
         let sourceTag = TranslationPolicy.sourceTag(of: block.text)
         let isMic = sourceTag == "마이크"
-        let displaySTT = sourceTag == nil ? block.text : TranslationPolicy.displayText(strippingSourceTag: block.text)
-        let accentColor: Color = selected ? .orange : (isMic ? .teal : (latest ? .accentColor : .secondary.opacity(0.25)))
+        let displaySTT = (sourceTag == nil ? block.text : TranslationPolicy.displayText(strippingSourceTag: block.text))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let accentColor: Color = selected ? .orange : Color.secondary.opacity(latest ? 0.35 : 0.20)
         let innerPad: CGFloat = compactDensity ? 7 : 10
+        let neutralSTTSurface: Color = Color(nsColor: .textBackgroundColor)
 
         return VStack(alignment: .leading, spacing: compactDensity ? 5 : 8) {
-            rowMetaBar(block: block, selected: selected, latest: latest, sourceTag: sourceTag, isMic: isMic, displaySTT: displaySTT)
+            rowMetaBar(block: block, selected: selected, latest: latest, sourceTag: sourceTag, isMic: isMic, displaySTT: displaySTT, onHidePinnedCard: onHidePinnedCard)
 
             if rowStyle == .stacked {
                 VStack(alignment: .leading, spacing: compactDensity ? 5 : 7) {
                     if effectiveShowSTT {
                         Text(displaySTT)
                             .font(.system(size: latest ? model.sttAppearance.latestFontSize : model.sttAppearance.fontSize, weight: latest ? .semibold : .regular))
-                            .foregroundStyle(latest ? model.sttAppearance.latestText.color : model.sttAppearance.text.color)
+                            .foregroundStyle(Color.primary)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(nil)
                             .lineSpacing(compactDensity ? 2 : (model.sttAppearance.fontSize <= 13 ? 3 : 5))
                             .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: .infinity, minHeight: pinnedCardMinHeight, alignment: .topLeading)
+                            .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, innerPad)
                             .padding(.vertical, compactDensity ? 5 : 8)
-                            .background(
-                                (latest ? model.sttAppearance.latestBackground.color : model.sttAppearance.background.color),
-                                in: RoundedRectangle(cornerRadius: 8)
-                            )
+                            .background(neutralSTTSurface, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.7))
                     }
 
                     if effectiveShowTranslation {
                         translationBody(block: block, inPlaceStreaming: inPlaceStreaming)
                             .padding(.horizontal, innerPad)
                             .padding(.vertical, compactDensity ? 5 : 8)
-                            .background((isMic ? Color.teal : Color.purple).opacity(latest ? 0.12 : 0.07), in: RoundedRectangle(cornerRadius: 8))
+                            .background((isMic ? Color.teal : Color.purple).opacity(latest ? 0.09 : 0.05), in: RoundedRectangle(cornerRadius: 8))
                     }
 
-                    if effectiveShowCoach && !block.advice.isEmpty {
+                    if showInlineAdvice && effectiveShowCoach && !block.advice.isEmpty {
                         VStack(alignment: .leading, spacing: 5) {
                             ForEach(block.advice) { item in
                                 AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
@@ -976,58 +1122,73 @@ struct LinkedConversationView: View {
                     }
                 }
             } else {
-                HStack(alignment: .top, spacing: 10) {
-                    if effectiveShowSTT {
+                VStack(alignment: .leading, spacing: compactDensity ? 5 : 7) {
+                    if effectiveShowSTT && effectiveShowTranslation {
+                        HStack(alignment: .top, spacing: 10) {
+                            Text(displaySTT)
+                                .font(.system(size: latest ? model.sttAppearance.latestFontSize : model.sttAppearance.fontSize, weight: latest ? .semibold : .regular))
+                                .foregroundStyle(Color.primary)
+                                .multilineTextAlignment(.leading)
+                                .lineLimit(nil)
+                                .lineSpacing(compactDensity ? 2 : (model.sttAppearance.fontSize <= 13 ? 3 : 5))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, minHeight: pinnedCardMinHeight, alignment: .topLeading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(innerPad)
+                                .frame(width: widths.stt, alignment: .topLeading)
+                                .background(neutralSTTSurface, in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.7))
+
+                            translationBody(block: block, inPlaceStreaming: inPlaceStreaming)
+                                .frame(minHeight: pinnedCardMinHeight, alignment: .topLeading)
+                                .padding(innerPad)
+                                .frame(width: widths.translation, alignment: .topLeading)
+                                .background((isMic ? Color.teal : Color.purple).opacity(latest ? 0.09 : 0.05), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else if effectiveShowSTT {
                         Text(displaySTT)
                             .font(.system(size: latest ? model.sttAppearance.latestFontSize : model.sttAppearance.fontSize, weight: latest ? .semibold : .regular))
-                            .foregroundStyle(latest ? model.sttAppearance.latestText.color : model.sttAppearance.text.color)
+                            .foregroundStyle(Color.primary)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(nil)
                             .lineSpacing(compactDensity ? 2 : (model.sttAppearance.fontSize <= 13 ? 3 : 5))
                             .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .frame(maxWidth: .infinity, minHeight: pinnedCardMinHeight, alignment: .topLeading)
+                            .fixedSize(horizontal: false, vertical: true)
                             .padding(innerPad)
-                            .frame(width: widths.stt, alignment: .topLeading)
-                            .background(
-                                (latest ? model.sttAppearance.latestBackground.color : model.sttAppearance.background.color),
-                                in: RoundedRectangle(cornerRadius: 8)
-                            )
-                    }
-
-                    if effectiveShowTranslation {
+                            .background(neutralSTTSurface, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.7))
+                    } else if effectiveShowTranslation {
                         translationBody(block: block, inPlaceStreaming: inPlaceStreaming)
+                            .frame(minHeight: pinnedCardMinHeight, alignment: .topLeading)
                             .padding(innerPad)
-                            .frame(width: widths.translation, alignment: .topLeading)
-                            .background((isMic ? Color.teal : Color.purple).opacity(latest ? 0.13 : 0.07), in: RoundedRectangle(cornerRadius: 8))
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .background((isMic ? Color.teal : Color.purple).opacity(latest ? 0.09 : 0.05), in: RoundedRectangle(cornerRadius: 8))
                     }
 
-                    if effectiveShowCoach {
-                        VStack(alignment: .leading, spacing: 6) {
-                            if block.advice.isEmpty {
-                                Text("—")
-                                    .font(.caption)
-                                    .foregroundStyle(.quaternary)
-                            } else {
-                                ForEach(block.advice) { item in
-                                    AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
-                                }
+                    if showInlineAdvice && effectiveShowCoach && !block.advice.isEmpty {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Label("코치 · 조언", systemImage: "sparkles")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.green)
+                            ForEach(block.advice) { item in
+                                AdviceCardBody(advice: item, fontSize: model.panelTypography.advice)
                             }
                         }
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(innerPad)
-                        .frame(width: widths.coach, alignment: .topLeading)
-                        .background(
-                            block.advice.isEmpty ? Color.secondary.opacity(0.03) : Color.green.opacity(0.10),
-                            in: RoundedRectangle(cornerRadius: 8)
-                        )
+                        .padding(.horizontal, innerPad)
+                        .padding(.vertical, compactDensity ? 5 : 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.green.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
-                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(compactDensity ? 7 : 10)
         .background(
             selected
                 ? Color.orange.opacity(0.10)
-                : (latest ? Color.accentColor.opacity(0.04) : Color(nsColor: .controlBackgroundColor).opacity(0.55)),
+                : Color(nsColor: .controlBackgroundColor).opacity(latest ? 0.65 : 0.45),
             in: RoundedRectangle(cornerRadius: 11)
         )
         .overlay(
@@ -1052,7 +1213,7 @@ struct LinkedConversationView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            if effectiveShowCoach && (!model.liveResponse.isEmpty || model.generating) {
+            if effectiveShowInlineCoach && (!model.liveResponse.isEmpty || model.generating) {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini)
                     if !model.liveResponse.isEmpty {

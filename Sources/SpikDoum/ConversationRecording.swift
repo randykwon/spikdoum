@@ -1,7 +1,7 @@
 import Foundation
 import AVFoundation
 
-struct AudioClipRecord: Codable, Identifiable, Equatable {
+struct AudioClipRecord: Codable, Identifiable, Equatable, Sendable {
     var id = UUID()
     var filename: String
     var startedAt: Date

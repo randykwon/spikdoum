@@ -42,8 +42,51 @@ final class AudioLevelMonitor: ObservableObject {
 final class LiveSTTDisplayStore: ObservableObject {
     @Published private(set) var text: String = ""
     @Published private(set) var sourceTag: String? = nil
+    @Published private(set) var lastCommittedText: String = ""
+    @Published private(set) var lastCommittedSourceTag: String? = nil
     @Published private(set) var updatedAt: Date = .distantPast
     private var perSource: [String: String] = [:]
+    private var lastCommitAt: Date = .distantPast
+
+    /// Continuous live caption text that seamlessly retains the latest committed sentence between
+    /// consecutive STT chunks so the live STT window never flashes empty or reverts to an idle placeholder.
+    var displayText: String {
+        if !text.isEmpty {
+            if !lastCommittedText.isEmpty,
+               sourceTag == lastCommittedSourceTag,
+               Date().timeIntervalSince(lastCommitAt) <= 5.0,
+               !Self.endsWithSentencePunctuation(lastCommittedText),
+               lastCommittedText.count + 1 + text.count <= 240,
+               !text.lowercased().hasPrefix(lastCommittedText.lowercased()) {
+                return "\(lastCommittedText) \(text)"
+            }
+            return text
+        }
+        return lastCommittedText
+    }
+
+    var displaySourceTag: String? {
+        !text.isEmpty ? sourceTag : lastCommittedSourceTag
+    }
+
+    var hasDisplayText: Bool {
+        !displayText.isEmpty
+    }
+
+    static func latestUtterance(from fullText: String) -> String {
+        let lines = fullText
+            .components(separatedBy: .newlines)
+            .map { TranslationPolicy.displayText(strippingSourceTag: $0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let last = lines.last else { return "" }
+        if last.count <= 240 { return last }
+        return String(last.suffix(240)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func endsWithSentencePunctuation(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.last else { return false }
+        return CharacterSet(charactersIn: ".!?。！？").contains(last)
+    }
 
     func update(text raw: String, sourceTag: String?) {
         let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -72,15 +115,63 @@ final class LiveSTTDisplayStore: ObservableObject {
         }
     }
 
+    /// Atomically commits a finalized chunk while clearing the interim hypothesis for that source.
+    /// Keeps the rolling sentence visible without any blank/placeholder frame between chunks.
+    func commit(text raw: String, sourceTag: String?) {
+        let cleaned = TranslationPolicy.displayText(strippingSourceTag: raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = sourceTag ?? "_default"
+        perSource.removeValue(forKey: key)
+
+        let nextInterimText: String
+        let nextInterimTag: String?
+        if let remaining = perSource.first {
+            nextInterimText = remaining.value
+            nextInterimTag = remaining.key == "_default" ? nil : remaining.key
+        } else {
+            nextInterimText = ""
+            nextInterimTag = nil
+        }
+
+        let now = Date()
+        var nextCommitted = lastCommittedText
+        var nextCommittedTag = lastCommittedSourceTag
+        if !cleaned.isEmpty {
+            let canAppend = !lastCommittedText.isEmpty
+                && lastCommittedSourceTag == sourceTag
+                && now.timeIntervalSince(lastCommitAt) <= 5.0
+                && !Self.endsWithSentencePunctuation(lastCommittedText)
+                && lastCommittedText.count + 1 + cleaned.count <= 240
+                && !cleaned.lowercased().hasPrefix(lastCommittedText.lowercased())
+            nextCommitted = canAppend ? "\(lastCommittedText) \(cleaned)" : cleaned
+            nextCommittedTag = sourceTag
+            lastCommitAt = now
+        }
+
+        if self.text != nextInterimText
+            || self.sourceTag != nextInterimTag
+            || self.lastCommittedText != nextCommitted
+            || self.lastCommittedSourceTag != nextCommittedTag {
+            self.text = nextInterimText
+            self.sourceTag = nextInterimTag
+            self.lastCommittedText = nextCommitted
+            self.lastCommittedSourceTag = nextCommittedTag
+            self.updatedAt = now
+        }
+    }
+
     func clear(sourceTag: String? = nil) {
         if let sourceTag {
             update(text: "", sourceTag: sourceTag)
             return
         }
         perSource.removeAll()
-        if !text.isEmpty || self.sourceTag != nil {
+        lastCommitAt = .distantPast
+        if !text.isEmpty || self.sourceTag != nil || !lastCommittedText.isEmpty || lastCommittedSourceTag != nil {
             text = ""
             self.sourceTag = nil
+            lastCommittedText = ""
+            lastCommittedSourceTag = nil
             updatedAt = .distantPast
         }
     }
@@ -97,6 +188,9 @@ final class AppModel: ObservableObject {
     let appleSpeechAssets = AppleSpeechAssetManager()
     let pptSlideSync = PPTSlideSyncMonitor()
     let liveSTT = LiveSTTDisplayStore()
+    let questionAudioRecorder = QuestionAudioClipRecorder()
+    let learningCapturer = LearningWindowCapturer()
+    var learningAutoCaptureTask: Task<Void, Never>?
     @Published var sttTier = SpeedQualityTier.loadSTT() {
         didSet { sttTier.saveSTT() }
     }
@@ -114,6 +208,17 @@ final class AppModel: ObservableObject {
     @Published var presentationRecommendation: PresentationRecommendation? = nil
     @Published var presentationError: String?
     @Published var linkedPPTNotesPendingUpdate: String? = nil
+    @Published var recordingQuestionNote = false
+    @Published var recordingQuestionSeconds: Int = 0
+    @Published var transcribingQuestionIDs: Set<UUID> = []
+    @Published var translatingQuestionIDs: Set<UUID> = []
+    @Published var recommendingQuestionIDs: Set<UUID> = []
+    @Published var autoCaptureQuestions: Bool = (UserDefaults.standard.object(forKey: "presentationAutoCaptureQuestionsV1") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(autoCaptureQuestions, forKey: "presentationAutoCaptureQuestionsV1") }
+    }
+    var questionRecordTimerTask: Task<Void, Never>?
+    var questionRecordStartedAt: Date?
+    var questionRecordBaselineSpanCount: Int = 0
     var presentationTimerTask: Task<Void, Never>?
     var presentationCompressToken = UUID()
     var presentationRecommendToken = UUID()
@@ -138,6 +243,11 @@ final class AppModel: ObservableObject {
     @Published var topHeaderCollapsed = UserDefaults.standard.bool(forKey: "topHeaderCollapsedV1") {
         didSet {
             UserDefaults.standard.set(topHeaderCollapsed, forKey: "topHeaderCollapsedV1")
+        }
+    }
+    @Published var sidebarAutoHide: Bool = (UserDefaults.standard.object(forKey: "sidebarAutoHideV1") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(sidebarAutoHide, forKey: "sidebarAutoHideV1")
         }
     }
     @Published var simpleFastMode = UserDefaults.standard.bool(forKey: "simpleFastMode") {
@@ -582,6 +692,7 @@ final class AppModel: ObservableObject {
         translationRetryAfter = .distantPast
         translationError = nil
         nativeTranslationSessions.removeAll()
+        unavailableAppleTranslationPairs.removeAll()
         if !(current?.transcript.isEmpty ?? true) {
             translateLatest(automatic: true)
         }
@@ -703,6 +814,7 @@ final class AppModel: ObservableObject {
             detectedSTTLanguage = nil
         }
         nativeTranslationSessions.removeAll()
+        unavailableAppleTranslationPairs.removeAll()
         translationRetryCount = 0
         translationRetryAfter = .distantPast
         translationError = nil
@@ -733,6 +845,7 @@ final class AppModel: ObservableObject {
         translationRetryAfter = .distantPast
         translationError = nil
         nativeTranslationSessions.removeAll()
+        unavailableAppleTranslationPairs.removeAll()
         if !(current?.transcript.isEmpty ?? true) {
             translateLatest(automatic: false)
         }
@@ -741,6 +854,7 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(targetLanguage, forKey: "targetLanguage")
             nativeTranslationSessions.removeAll()
+            unavailableAppleTranslationPairs.removeAll()
         }
     }
     var targetLanguageSpec: SupportedLanguage {
@@ -797,6 +911,7 @@ final class AppModel: ObservableObject {
     var translationRetryAfter = Date.distantPast
     var translationToken = UUID()
     var nativeTranslationSessions: [String: TranslationSession] = [:]
+    var unavailableAppleTranslationPairs: Set<String> = []
     var debounce: Task<Void, Never>?
     var responseToken = UUID()
     var languages: [(String, String)] {
@@ -820,6 +935,14 @@ final class AppModel: ObservableObject {
     var languageName: String { LanguageCatalog.displayName(for: language, in: uiLanguage) }
     var targetLanguageName: String { targetLanguageSpec.displayName(in: uiLanguage) }
     @Published var message: String?
+    @Published var coachStrategy: CoachStrategy = CoachStrategy.load() {
+        didSet {
+            coachStrategy.save()
+            if oldValue != coachStrategy {
+                lastContext = ""
+            }
+        }
+    }
     @Published var goal = "상대의 의도를 이해하고, 명확하고 자연스럽게 대화를 이어가기"
     let capture = SpeechCapture()
     var timer: Task<Void, Never>?
@@ -1083,6 +1206,9 @@ final class AppModel: ObservableObject {
         conversations[index].transcript = text
         if conversations[index].presentation != nil {
             syncPresentationChecklist(with: text, at: index)
+            if perspective == .presentation {
+                detectAndAutoCapturePresentationQuestion(at: index)
+            }
         }
         if followLive, let selectedLiveBlockID, !(conversations[index].transcriptSpans ?? []).contains(where: { $0.id == selectedLiveBlockID }) { self.selectedLiveBlockID = nil }
         if conversations[index].title == "새 대화", text.count > 5 { conversations[index].title = String(text.prefix(24)) }
